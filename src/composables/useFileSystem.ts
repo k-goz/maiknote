@@ -235,6 +235,57 @@ export function useFileSystem() {
     }
   }
 
+  // ============================================
+  // Boss Brain Vault Operations
+  // ============================================
+
+  async function getDefaultVaultPath(): Promise<string> {
+    try {
+      return await safeInvoke<string>('get_default_vault_path')
+    } catch (e) {
+      console.error('Failed to get default vault path:', e)
+      return ''
+    }
+  }
+
+  async function ensureVaultStructure(vaultPath: string): Promise<void> {
+    try {
+      await safeInvoke('ensure_vault_structure', { vaultPath })
+    } catch (e) {
+      console.error('Failed to ensure vault structure:', e)
+      throw e
+    }
+  }
+
+  async function scanVaultFiles(vaultPath: string): Promise<Array<{ relative_path: string; modified_ms: number; size: number }>> {
+    try {
+      return await safeInvoke('scan_vault_files', { vaultPath })
+    } catch (e) {
+      console.error('Failed to scan vault files:', e)
+      return []
+    }
+  }
+
+  async function readVaultTextFile(vaultPath: string, relativePath: string): Promise<string> {
+    return await safeInvoke<string>('read_vault_text_file', { vaultPath, relativePath })
+  }
+
+  async function writeVaultTextFile(vaultPath: string, relativePath: string, content: string): Promise<void> {
+    await safeInvoke('write_vault_text_file', { vaultPath, relativePath, content })
+  }
+
+  async function deleteVaultFile(vaultPath: string, relativePath: string): Promise<void> {
+    await safeInvoke('delete_vault_file', { vaultPath, relativePath })
+  }
+
+  async function pathExists(path: string): Promise<boolean> {
+    try {
+      return await safeInvoke<boolean>('path_exists', { path })
+    } catch {
+      return false
+    }
+  }
+
   return {
     getICloudPath,
     readMetadata,
@@ -252,5 +303,13 @@ export function useFileSystem() {
     renameDirectoryFolder,
     deleteDirectoryFolder,
     moveNoteFile,
+    // Boss Brain
+    getDefaultVaultPath,
+    ensureVaultStructure,
+    scanVaultFiles,
+    readVaultTextFile,
+    writeVaultTextFile,
+    deleteVaultFile,
+    pathExists,
   }
 }

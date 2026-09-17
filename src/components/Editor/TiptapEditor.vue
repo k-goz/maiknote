@@ -206,6 +206,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   update: [markdown: string]
+  clickWikilink: [target: string]
 }>()
 
 const imeDebugEnabled = () => (window as any).__maiknoteImeDebug !== false
@@ -1133,6 +1134,32 @@ const editor = useEditor({
       return false
     },
     handleClick(view, _pos, event) {
+      // 优先检测 wikilink 点击跳转
+      try {
+        const coords = { left: event.clientX, top: event.clientY }
+        const domPos = view.posAtCoords(coords)
+        if (domPos && domPos.pos >= 0) {
+          const $pos = view.state.doc.resolve(domPos.pos)
+          const parent = $pos.parent
+          const text = parent.textContent || ''
+          const offset = $pos.parentOffset
+          const regex = /\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|([^\]]+))?\]\]/g
+          let m
+          while ((m = regex.exec(text)) !== null) {
+            const start = m.index
+            const end = m.index + m[0].length
+            if (offset >= start && offset <= end) {
+              const target = m[1].trim()
+              event.preventDefault()
+              emit('clickWikilink', target)
+              return true
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Error checking wikilink click:', err)
+      }
+
       // 只处理左键点击，右键点击保持选择状态
       if (event.button !== 0) {
         return true

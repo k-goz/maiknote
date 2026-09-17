@@ -162,7 +162,12 @@ onMounted(async () => {
     if (focused) {
       // 窗口获得焦点时检查是否在可见显示器内
       ensureWindowVisible()
+      // 外部 AI 编辑兼容：检查 Vault 是否发生变化并安全重新索引
+      noteStore.checkExternalChanges()
     }
+  })
+  window.addEventListener('focus', () => {
+    noteStore.checkExternalChanges()
   })
   // 监听键盘快捷键 Cmd+F 打开搜索页面，Cmd+W 关闭窗口
   window.addEventListener('keydown', (event) => {

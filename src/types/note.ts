@@ -13,6 +13,35 @@ export interface Note {
   directoryId?: string // null/undefined = root directory
   backgroundColor?: string // Optional background color for the note
   trashedAt?: number // Unix timestamp when moved to trash
+  // Boss Brain V1 fields
+  relativePath?: string // e.g. "00-Inbox/2026-09-17-2342-healthtwin-home-cta-a82c.md"
+  status?: string // 'inbox' | 'active' | 'archived' | string
+  type?: string // 'note' | 'project' | 'area' | 'decision' | string
+  project?: string // Associated project
+  source?: string // Default 'maiknote'
+  frontmatter?: BossBrainFrontmatter // Parsed frontmatter
+  wikilinks?: string[] // Extracted wikilinks e.g. ["HealthTwin", "Roadmap"]
+  backlinks?: string[] // Notes referencing this note
+  mtime?: number // Disk modification timestamp
+  isDirty?: boolean // Has unpersisted local changes
+  hasConflict?: boolean // External change detected while local note is dirty
+  conflictContent?: string // Disk content when conflict occurred
+}
+
+export interface BossBrainFrontmatter {
+  id: string
+  title: string
+  created: string // ISO 8601
+  updated: string // ISO 8601
+  type?: string
+  status?: string
+  project?: string
+  tags?: string[]
+  source?: string
+  aliases?: string[]
+  supersedes?: string
+  superseded_by?: string
+  [key: string]: any
 }
 
 /**

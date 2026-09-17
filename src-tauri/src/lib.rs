@@ -875,6 +875,144 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
+/// Information about a markdown file in the Boss Brain vault
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct VaultFileInfo {
+    pub relative_path: String,
+    pub modified_ms: u64,
+    pub size: u64,
+}
+
+/// Get default Boss Brain Vault path in iCloud
+#[tauri::command]
+async fn get_default_vault_path() -> Result<String, String> {
+    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    let path = format!("{}/Library/Mobile Documents/com~apple~CloudDocs/BossBrain", home);
+    Ok(path)
+}
+
+/// Initialize standard Boss Brain vault folders
+#[tauri::command]
+async fn ensure_vault_structure(vault_path: String) -> Result<(), String> {
+    let root = PathBuf::from(&vault_path);
+    let folders = [
+        "00-Inbox",
+        "01-Projects",
+        "02-Areas",
+        "03-Knowledge",
+        "04-Playbooks",
+        "05-Decisions",
+        "90-Archive",
+        "_assets",
+        "_system",
+        ".bossbrain",
+    ];
+
+    for folder in &folders {
+        let p = root.join(folder);
+        fs::create_dir_all(&p).map_err(|e| format!("Failed to create folder {:?}: {}", p, e))?;
+    }
+
+    Ok(())
+}
+
+fn walk_dir_md(dir: &std::path::Path, root: &std::path::Path, results: &mut Vec<VaultFileInfo>) -> std::io::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = entry.file_name().to_string_lossy().to_string();
+
+        // Skip hidden/system directories except .bossbrain
+        if file_name.starts_with('.') && file_name != ".bossbrain" {
+            continue;
+        }
+        if file_name == ".git" || file_name == "node_modules" || file_name == "target" || file_name == ".bossbrain" {
+            continue;
+        }
+
+        if path.is_dir() {
+            walk_dir_md(&path, root, results)?;
+        } else if path.is_file() {
+            if path.extension().and_then(|s| s.to_str()) == Some("md") {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    let rel_str = rel.to_string_lossy().to_string();
+                    let metadata = entry.metadata()?;
+                    let modified_ms = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let size = metadata.len();
+
+                    results.push(VaultFileInfo {
+                        relative_path: rel_str,
+                        modified_ms,
+                        size,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Recursively scan vault for .md files
+#[tauri::command]
+async fn scan_vault_files(vault_path: String) -> Result<Vec<VaultFileInfo>, String> {
+    let root = PathBuf::from(&vault_path);
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut results = Vec::new();
+    walk_dir_md(&root, &root, &mut results).map_err(|e| e.to_string())?;
+
+    results.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(results)
+}
+
+/// Read text file at relative path in vault
+#[tauri::command]
+async fn read_vault_text_file(vault_path: String, relative_path: String) -> Result<String, String> {
+    let path = PathBuf::from(vault_path).join(relative_path);
+    if !path.exists() {
+        return Err("File does not exist".to_string());
+    }
+    fs::read_to_string(path).map_err(|e| e.to_string())
+}
+
+/// Write text file at relative path in vault
+#[tauri::command]
+async fn write_vault_text_file(vault_path: String, relative_path: String, content: String) -> Result<(), String> {
+    let path = PathBuf::from(vault_path).join(relative_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::write(path, content).map_err(|e| e.to_string())
+}
+
+/// Delete file at relative path in vault
+#[tauri::command]
+async fn delete_vault_file(vault_path: String, relative_path: String) -> Result<(), String> {
+    let path = PathBuf::from(vault_path).join(relative_path);
+    if path.exists() {
+        fs::remove_file(path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Check if a path exists
+#[tauri::command]
+async fn path_exists(path: String) -> Result<bool, String> {
+    Ok(PathBuf::from(path).exists())
+}
+
 /// Set window alpha transparency (0.0 - 1.0)
 #[tauri::command]
 async fn set_window_alpha(
@@ -1459,6 +1597,13 @@ pub fn run() {
             autostart::disable_autostart,
             autostart::is_autostart_enabled,
             get_network_info,
+            get_default_vault_path,
+            ensure_vault_structure,
+            scan_vault_files,
+            read_vault_text_file,
+            write_vault_text_file,
+            delete_vault_file,
+            path_exists,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

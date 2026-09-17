@@ -566,6 +566,47 @@ function handleEditorUpdate(md: string) {
   }
 }
 
+const referencingNotes = computed(() => {
+  const note = currentNote.value
+  if (!note || !note.backlinks || note.backlinks.length === 0) return []
+  return note.backlinks
+    .map(id => noteStore.notes.find(n => n.id === id))
+    .filter((n): n is typeof noteStore.notes[0] => n !== undefined)
+})
+
+function showToast(message: string, duration = 2500) {
+  const toast = document.createElement('div')
+  toast.textContent = message
+  toast.style.cssText = `
+    position: fixed;
+    top: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(30, 30, 30, 0.9);
+    backdrop-filter: blur(12px);
+    color: #fff;
+    padding: 8px 18px;
+    border-radius: 8px;
+    z-index: 10000;
+    font-size: 13px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+  `
+  document.body.appendChild(toast)
+  setTimeout(() => {
+    toast.style.opacity = '0'
+    setTimeout(() => toast.remove(), 200)
+  }, duration)
+}
+
+function handleWikilinkClick(target: string) {
+  const success = noteStore.navigateToWikilink(target)
+  if (!success) {
+    showToast(`未找到笔记: [[${target}]]`)
+  }
+}
+
 // 处理源码模式下的输入事件，确保内容实时同步
 function handleSourceInput(e: Event) {
   const target = e.target as HTMLTextAreaElement
@@ -653,6 +694,19 @@ function handleToggleSourceMode() {
     </Transition>
 
     <div class="editor-wrapper">
+      <!-- 外部 AI 修改冲突提示横幅 -->
+      <div v-if="currentNote?.hasConflict" class="conflict-banner">
+        <div class="conflict-msg">
+          <i class="i-mdi-alert-circle"></i>
+          <span>检测到外部 AI / 编辑器修改了该笔记，与本地未保存编辑冲突</span>
+        </div>
+        <div class="conflict-btns">
+          <button class="conflict-btn external" @click="currentNote && noteStore.resolveConflict(currentNote.id, 'keep-disk')">使用外部版本</button>
+          <button class="conflict-btn local" @click="currentNote && noteStore.resolveConflict(currentNote.id, 'keep-local')">保留本地编辑</button>
+          <button class="conflict-btn copy" @click="currentNote && noteStore.resolveConflict(currentNote.id, 'conflict-copy')">另存冲突副本</button>
+        </div>
+      </div>
+
       <div
         class="editor-content-wrapper"
         :key="currentNote?.id"
@@ -682,7 +736,27 @@ function handleToggleSourceMode() {
           :is-locked="isLocked"
           :note-bg-color="currentNote?.backgroundColor"
           @update="handleEditorUpdate"
+          @click-wikilink="handleWikilinkClick"
         />
+
+        <!-- 反向链接 (Backlinks) 展示 -->
+        <div v-if="referencingNotes.length > 0" class="backlinks-section">
+          <div class="backlinks-header">
+            <i class="i-mdi-link-variant"></i>
+            <span>被以下笔记引用 ({{ referencingNotes.length }}):</span>
+          </div>
+          <div class="backlinks-list">
+            <button
+              v-for="r in referencingNotes"
+              :key="r.id"
+              class="backlink-badge"
+              @click.stop="noteStore.selectNote(r.id)"
+              :title="r.title"
+            >
+              [[ {{ r.title }} ]]
+            </button>
+          </div>
+        </div>
       </div>
 
       <!-- navigation hints -->
@@ -1466,5 +1540,96 @@ function handleToggleSourceMode() {
 /* 漩涡删除期间阻止交互 */
 .editor-content-wrapper.vortex-deleting {
   pointer-events: none;
+}
+
+/* Conflict banner */
+.conflict-banner {
+  background: rgba(255, 170, 0, 0.15);
+  border: 1px solid rgba(255, 170, 0, 0.4);
+  backdrop-filter: blur(10px);
+  padding: 8px 12px;
+  border-radius: 6px;
+  margin: 8px 16px 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  z-index: 20;
+}
+
+.conflict-msg {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--color-text);
+  font-weight: 500;
+}
+
+.conflict-btns {
+  display: flex;
+  gap: 8px;
+}
+
+.conflict-btn {
+  padding: 3px 10px;
+  border-radius: 4px;
+  border: 1px solid rgba(128, 128, 128, 0.2);
+  background: var(--color-popup-bg);
+  color: var(--color-text);
+  cursor: pointer;
+  font-size: 11px;
+  transition: all 0.15s ease;
+}
+
+.conflict-btn:hover {
+  background: var(--color-popup-hover);
+}
+
+.conflict-btn.external {
+  border-color: rgba(255, 170, 0, 0.6);
+  color: #ff9900;
+}
+
+/* Backlinks section */
+.backlinks-section {
+  margin-top: 24px;
+  padding: 12px 16px;
+  border-top: 1px dashed rgba(128, 128, 128, 0.2);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.backlinks-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  font-weight: 500;
+}
+
+.backlinks-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.backlink-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: rgba(0, 113, 227, 0.08);
+  border: 1px solid rgba(0, 113, 227, 0.2);
+  color: #0071e3;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.backlink-badge:hover {
+  background: rgba(0, 113, 227, 0.16);
+  transform: translateY(-1px);
 }
 </style>
