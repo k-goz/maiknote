@@ -11,6 +11,11 @@ import { openUrl } from '@tauri-apps/plugin-opener'
 import AssistantEditor from '@/components/Assistant/AssistantEditor.vue'
 import { useI18n } from 'vue-i18n'
 import { useTheme } from '@/composables/useTheme'
+import { open } from '@tauri-apps/plugin-dialog'
+import { setNativeDialogOpen } from '@/stores/dialogStore'
+import { initializeBossBrainVault } from '@/services/vaultManager'
+import { migrateLegacyMaikNote, type MigrationReport } from '@/services/legacyMigrator'
+import { useNoteStore } from '@/stores/noteStore'
 
 // 安全获取 Tauri 窗口
 const isTauri = typeof window !== 'undefined' && ('__TAURI__' in window || '__TAURI_INTERNALS__' in window)
@@ -99,15 +104,85 @@ const assistantsStore = useAssistantsStore()
 const { t, locale } = useI18n()
 
 // 分类导航
-type CategoryKey = 'general' | 'ai' | 'shortcuts' | 'about'
+type CategoryKey = 'general' | 'vault' | 'ai' | 'shortcuts' | 'about'
 const activeCategory = ref<CategoryKey>('general')
 
 const categories = computed(() => [
   { key: 'general' as const, icon: 'i-mdi-tune', label: t('settings.general') },
+  { key: 'vault' as const, icon: 'i-mdi-brain', label: 'Boss Brain' },
   { key: 'ai' as const, icon: 'i-mdi-robot', label: t('settings.ai') },
   { key: 'shortcuts' as const, icon: 'i-mdi-keyboard', label: t('settings.shortcuts') },
   { key: 'about' as const, icon: 'i-mdi-information-outline', label: t('settings.about') },
 ])
+
+const noteStore = useNoteStore()
+const migrationRunning = ref(false)
+const migrationReport = ref<MigrationReport | null>(null)
+
+async function selectVaultDirectory() {
+  try {
+    setNativeDialogOpen(true)
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: '选择 Boss Brain 知识库目录',
+      defaultPath: settingStore.settings.vaultPath || undefined,
+    })
+    if (selected && typeof selected === 'string') {
+      settingStore.updateSettings('vaultPath', selected)
+      await initializeBossBrainVault(selected)
+      await noteStore.rescanVault(true)
+      showToast('知识库目录已更新并重新索引')
+    }
+  } catch (e: any) {
+    console.error('Failed selecting vault directory:', e)
+    showToast(`选择目录失败: ${e.message || e}`)
+  } finally {
+    setNativeDialogOpen(false)
+  }
+}
+
+async function handleInitVault() {
+  if (!settingStore.settings.vaultPath) {
+    showToast('请先选择知识库目录')
+    return
+  }
+  try {
+    await initializeBossBrainVault(settingStore.settings.vaultPath)
+    await noteStore.rescanVault(true)
+    showToast('Boss Brain 知识库初始化完成')
+  } catch (e: any) {
+    showToast(`初始化失败: ${e.message || e}`)
+  }
+}
+
+async function handleRescan() {
+  try {
+    await noteStore.rescanVault(true)
+    showToast('知识库已完全重新扫描并重建缓存')
+  } catch (e: any) {
+    showToast(`重新扫描失败: ${e.message || e}`)
+  }
+}
+
+async function handleMigrate() {
+  if (migrationRunning.value) return
+  if (!settingStore.settings.vaultPath) {
+    showToast('请先设置 Boss Brain Vault 目录')
+    return
+  }
+  migrationRunning.value = true
+  try {
+    const report = await migrateLegacyMaikNote(settingStore.settings.vaultPath)
+    migrationReport.value = report
+    await noteStore.rescanVault(true)
+    showToast(`旧笔记导入完成: 成功 ${report.success} 篇`)
+  } catch (e: any) {
+    showToast(`导入失败: ${e.message || e}`)
+  } finally {
+    migrationRunning.value = false
+  }
+}
 
 // 同步语言设置到 i18n locale
 watch(() => settingStore.settings.language, (newLang) => {
@@ -730,6 +805,97 @@ function getPromptPreview(prompt: string): string {
             </div>
           </div>
 
+        </section>
+
+        <!-- Boss Brain / Vault -->
+        <section v-if="activeCategory === 'vault'" class="settings-section">
+          <div class="setting-item">
+            <div class="setting-label">
+              <span class="setting-name">启用 Boss Brain 知识库模式</span>
+              <span class="setting-desc">以 Markdown 为长期事实源，支持 Frontmatter、Wikilink 与外部 AI 协同</span>
+            </div>
+            <label class="toggle-switch">
+              <input
+                type="checkbox"
+                :checked="settingStore.settings.enableBossBrain"
+                @change="settingStore.updateSettings('enableBossBrain', ($event.target as HTMLInputElement).checked)"
+              />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+
+          <div class="setting-item column">
+            <div class="setting-label">
+              <span class="setting-name">Boss Brain Vault 路径</span>
+              <span class="setting-desc">存储长期记忆与 Markdown 笔记的本地文件夹</span>
+            </div>
+            <div class="vault-path-control">
+              <input
+                type="text"
+                class="vault-path-input"
+                :value="settingStore.settings.vaultPath"
+                placeholder="~/Library/Mobile Documents/com~apple~CloudDocs/BossBrain"
+                readonly
+              />
+              <button class="vault-btn primary" @click="selectVaultDirectory">
+                <i class="i-mdi-folder-open"></i>
+                <span>选择目录</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="setting-item">
+            <div class="setting-label">
+              <span class="setting-name">初始化标准结构</span>
+              <span class="setting-desc">生成 00-Inbox, 01-Projects, _system/ 等标准目录与协议规范</span>
+            </div>
+            <button class="vault-btn secondary" @click="handleInitVault">
+              <i class="i-mdi-cog-sync"></i>
+              <span>初始化 Boss Brain</span>
+            </button>
+          </div>
+
+          <div class="setting-item">
+            <div class="setting-label">
+              <span class="setting-name">重新扫描知识库</span>
+              <span class="setting-desc">遍历所有 Markdown 文件并完全重建 .bossbrain 索引缓存</span>
+            </div>
+            <button class="vault-btn secondary" @click="handleRescan">
+              <i class="i-mdi-refresh"></i>
+              <span>重新扫描知识库</span>
+            </button>
+          </div>
+
+          <!-- 旧数据安全迁移 -->
+          <div class="setting-item column">
+            <div class="setting-label">
+              <span class="setting-name">导入旧 MaikNote 笔记</span>
+              <span class="setting-desc">从旧 iCloud 目录以只读复制 (Copy) 方式导入，绝不修改或删除原数据</span>
+            </div>
+            <button class="vault-btn migration" :disabled="migrationRunning" @click="handleMigrate">
+              <i class="i-mdi-import"></i>
+              <span>{{ migrationRunning ? '正在导入中...' : '开始导入旧数据 (安全复制)' }}</span>
+            </button>
+
+            <div v-if="migrationReport" class="migration-report-card">
+              <div class="report-header">
+                <i class="i-mdi-check-circle"></i>
+                <span>导入报告</span>
+              </div>
+              <div class="report-grid">
+                <div>总笔记数: <b>{{ migrationReport.total }}</b></div>
+                <div>成功: <b class="text-green">{{ migrationReport.success }}</b></div>
+                <div>跳过: <b>{{ migrationReport.skipped }}</b></div>
+                <div>冲突: <b>{{ migrationReport.conflicts }}</b></div>
+                <div>失败: <b class="text-red">{{ migrationReport.failed }}</b></div>
+              </div>
+              <div v-if="migrationReport.errors.length > 0" class="report-errors">
+                <div v-for="err in migrationReport.errors" :key="err.id" class="report-err-item">
+                  {{ err.id }}: {{ err.error }}
+                </div>
+              </div>
+            </div>
+          </div>
         </section>
 
         <!-- AI -->
@@ -1866,4 +2032,94 @@ function getPromptPreview(prompt: string): string {
 .add-assistant-btn i {
   font-size: 16px;
 }
+
+/* Vault & Boss Brain Settings */
+.vault-path-control {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+  margin-top: 8px;
+}
+
+.vault-path-input {
+  flex: 1;
+  padding: 8px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: 12px;
+  outline: none;
+}
+
+.vault-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: 13px;
+  cursor: pointer;
+  transition: all var(--duration-fast) var(--ease-out);
+}
+
+.vault-btn:hover {
+  background: var(--color-border);
+}
+
+.vault-btn.primary {
+  background: #0071e3;
+  color: #fff;
+  border-color: #0071e3;
+}
+
+.vault-btn.primary:hover {
+  background: #0077ed;
+}
+
+.vault-btn.migration {
+  width: 100%;
+  justify-content: center;
+  margin-top: 8px;
+  background: rgba(0, 113, 227, 0.1);
+  color: #0071e3;
+  border-color: rgba(0, 113, 227, 0.3);
+}
+
+.migration-report-card {
+  margin-top: 10px;
+  padding: 12px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-size: 12px;
+}
+
+.report-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  margin-bottom: 8px;
+  color: #0071e3;
+}
+
+.report-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));
+  gap: 8px;
+}
+
+.report-errors {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--color-border);
+  color: #ef4444;
+}
+
+.text-green { color: #10b981; }
+.text-red { color: #ef4444; }
 </style>
