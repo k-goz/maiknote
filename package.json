@@ -11,7 +11,7 @@
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
-    "tauri": "tauri",
+    "tauri": "node -e \"const { spawnSync } = require('node:child_process'); const args = process.argv.slice(1); const hasKey = process.env.TAURI_SIGNING_PRIVATE_KEY && process.env.TAURI_SIGNING_PRIVATE_KEY.trim(); if (!hasKey && args.includes('build') && !args.includes('-c') && !args.includes('--config')) { args.push('-c', JSON.stringify({ bundle: { createUpdaterArtifacts: false } })); } const bin = process.platform === 'win32' ? 'tauri.cmd' : 'tauri'; const r = spawnSync(bin, args, { stdio: 'inherit' }); process.exit(r.status ?? 0);\" --",
     "sync-version": "node scripts/sync-version.js",
     "test": "node --experimental-strip-types --test tests/unit.test.mjs tests/integration.test.mjs tests/bossbrain.test.mjs tests/filesystem-integration.test.mjs",
     "pretauri": "npm run sync-version",
