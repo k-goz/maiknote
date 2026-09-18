@@ -13,6 +13,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "sync-version": "node scripts/sync-version.js",
+    "test": "node --experimental-strip-types --test tests/unit.test.mjs tests/integration.test.mjs tests/bossbrain.test.mjs tests/filesystem-integration.test.mjs",
     "pretauri": "npm run sync-version",
     "postinstall": "patch-package"
   },
@@ -44,9 +45,10 @@
     "@tiptap/pm": "^2.10.0",
     "@tiptap/starter-kit": "^2.10.0",
     "@tiptap/suggestion": "^2.10.0",
-    "@tiptap/vue-3": "^2.10.0",
+    "@tiptap/vue-3": "^3.5.13",
     "@vueuse/core": "^14.2.1",
     "highlight.js": "^11.11.1",
+    "js-yaml": "^5.4.2",
     "lowlight": "^3.2.0",
     "pinia": "^3.0.4",
     "prosemirror-state": "^1.4.4",
@@ -57,6 +59,7 @@
   "devDependencies": {
     "@iconify-json/mdi": "^1.2.3",
     "@tauri-apps/cli": "^2",
+    "@types/js-yaml": "^4.0.9",
     "@unocss/preset-icons": "^66.6.6",
     "@vitejs/plugin-vue": "^5.2.1",
     "patch-package": "^8.0.1",
