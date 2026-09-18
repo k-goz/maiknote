@@ -3,7 +3,12 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
-import { extractFrontmatterAndBody, stringifyWithFrontmatter } from '../src/utils/frontmatter.ts'
+import {
+  extractFrontmatterAndBody,
+  stringifyWithFrontmatter,
+  buildCanonicalFrontmatter,
+  extractTitle,
+} from '../src/utils/frontmatter.ts'
 import { diffVaultSnapshot, mergeScannedWithPreservedNotes } from '../src/services/vaultChangeDetector.ts'
 import { resolveNoteConflict } from '../src/services/conflictResolver.ts'
 
@@ -151,21 +156,27 @@ class MockVaultEnvironment {
     return true
   }
 
+  async saveNoteToStorage(targetNote) {
+    const fm = buildCanonicalFrontmatter(targetNote, targetNote.frontmatter)
+    targetNote.frontmatter = fm
+    const full = stringifyWithFrontmatter(fm, targetNote.content)
+    this.writeVaultTextFile(targetNote.relativePath, full)
+    const stat = fs.statSync(path.join(this.vaultDir, targetNote.relativePath))
+    targetNote.mtime = stat.mtimeMs
+    targetNote.size = stat.size
+    this.lastDiskSnapshot.set(targetNote.relativePath, { mtime: stat.mtimeMs, size: stat.size })
+    targetNote.isDirty = false
+  }
+
   // Corresponds to resolveConflict in noteStore.ts using resolveNoteConflict
-  async resolveConflict(noteId, choice) {
+  async resolveConflict(noteId, choice, customSaveNote) {
     const note = this.notes.find(n => n.id === noteId)
     if (!note) return
 
     await resolveNoteConflict(note, choice, {
-      saveNote: async (targetNote) => {
-        const full = stringifyWithFrontmatter(targetNote.frontmatter || {}, targetNote.content)
-        this.writeVaultTextFile(targetNote.relativePath, full)
-        const stat = fs.statSync(path.join(this.vaultDir, targetNote.relativePath))
-        targetNote.mtime = stat.mtimeMs
-        targetNote.size = stat.size
-        this.lastDiskSnapshot.set(targetNote.relativePath, { mtime: stat.mtimeMs, size: stat.size })
-        targetNote.isDirty = false
-      },
+      saveNote: customSaveNote || (async (targetNote) => {
+        await this.saveNoteToStorage(targetNote)
+      }),
       createRecoveredNote: async (title, content, sourceNote) => {
         const rel = `00-Inbox/${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Date.now()}.md`
         const fm = {
@@ -684,5 +695,143 @@ test('[INTEGRATION] 15. [F3-02] Recovered copy note has complete Frontmatter and
     env.cleanup()
   }
 })
+
+test('[INTEGRATION] 16. [H2] Title change integration: body change updates title in markdown frontmatter while preserving custom frontmatter', async () => {
+  const env = new MockVaultEnvironment()
+  try {
+    const originalFm = {
+      title: 'New Note',
+      project: 'HealthTwin',
+      custom_field: 'preserve-me',
+    }
+    const initialContent = '# New Note\n\nInitial body'
+    env.writeVaultTextFile('00-Inbox/healthtwin-note.md', stringifyWithFrontmatter(originalFm, initialContent))
+    await env.rescanVault()
+
+    const note = env.notes.find(n => n.relativePath === '00-Inbox/healthtwin-note.md')
+    assert.ok(note)
+    assert.equal(note.title, 'New Note')
+    assert.equal(note.frontmatter.custom_field, 'preserve-me')
+
+    // App modifies body to '# HealthTwin 产品架构'
+    const newBody = '# HealthTwin 产品架构\n\nNew architecture specifications.'
+    note.content = newBody
+    note.title = extractTitle(newBody)
+    assert.equal(note.title, 'HealthTwin 产品架构')
+
+    // Persist through canonical pipeline
+    await env.saveNoteToStorage(note)
+
+    // Re-read file from disk
+    const diskRaw = env.readVaultTextFile('00-Inbox/healthtwin-note.md')
+    const parsed = extractFrontmatterAndBody(diskRaw)
+    assert.equal(parsed.hasFrontmatter, true)
+    assert.equal(parsed.frontmatter.title, 'HealthTwin 产品架构', 'Title must be updated to Note state')
+    assert.equal(parsed.frontmatter.custom_field, 'preserve-me', 'Unknown custom field must be preserved')
+    assert.equal(parsed.frontmatter.project, 'HealthTwin')
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('[INTEGRATION] 17. [H2] In-memory Project and Tags take strict precedence over outdated Frontmatter on disk write', async () => {
+  const env = new MockVaultEnvironment()
+  try {
+    const originalFm = {
+      id: 'proj-tags-1',
+      title: 'Architecture Overview',
+      project: 'OldProject',
+      tags: ['old'],
+      custom_prop: 'keep_this',
+    }
+    env.writeVaultTextFile('00-Inbox/arch.md', stringifyWithFrontmatter(originalFm, 'System overview content'))
+    await env.rescanVault()
+
+    const note = env.notes.find(n => n.id === 'proj-tags-1')
+    assert.ok(note)
+
+    // In memory updates
+    note.project = 'BossBrain'
+    note.tags = ['memory', 'ai']
+
+    // Persist
+    await env.saveNoteToStorage(note)
+
+    // Re-read file from disk
+    const diskRaw = env.readVaultTextFile('00-Inbox/arch.md')
+    const parsed = extractFrontmatterAndBody(diskRaw)
+    assert.equal(parsed.frontmatter.project, 'BossBrain', 'In-memory project must override old frontmatter')
+    assert.deepEqual(parsed.frontmatter.tags, ['memory', 'ai'], 'In-memory tags must override old frontmatter')
+    assert.equal(parsed.frontmatter.custom_prop, 'keep_this', 'Custom property preserved')
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('[INTEGRATION] 18. [H1] Transactional conflict save: callback throw maintains dirty and conflict flags, and subsequent save restores clean state', async () => {
+  const env = new MockVaultEnvironment()
+  try {
+    const originalFm = {
+      id: 'note-h1-int',
+      title: 'Production Data',
+      project: 'BossBrain',
+      tags: ['prod'],
+      source: 'maiknote',
+    }
+    env.writeVaultTextFile('00-Inbox/prod.md', stringifyWithFrontmatter(originalFm, 'Initial production data'))
+    await env.rescanVault()
+    env.currentNoteId = 'note-h1-int'
+
+    const note = env.notes.find(n => n.id === 'note-h1-int')
+    note.content = 'Important unsaved content'
+    note.isDirty = true
+
+    // External agent modifies file on disk -> conflict
+    await new Promise(r => setTimeout(r, 20))
+    env.writeVaultTextFile('00-Inbox/prod.md', stringifyWithFrontmatter(originalFm, 'External AI modified production data'))
+    await env.checkExternalChanges()
+
+    const currentNote = env.notes.find(n => n.id === 'note-h1-int')
+    assert.ok(currentNote)
+    assert.equal(currentNote.hasConflict, true)
+    assert.equal(currentNote.conflictType, 'modified')
+
+    // 1. keep-local with simulated save failure
+    await assert.rejects(
+      async () => {
+        await env.resolveConflict('note-h1-int', 'keep-local', async () => {
+          throw new Error('Simulated I/O write error on disk')
+        })
+      },
+      /Simulated I\/O write error on disk/
+    )
+
+    // Assertions: content not lost, isDirty and hasConflict maintained
+    assert.equal(currentNote.content, 'Important unsaved content')
+    assert.equal(currentNote.isDirty, true)
+    assert.equal(currentNote.hasConflict, true)
+    assert.equal(currentNote.conflictType, 'modified')
+
+    // 2. Resolve keep-local with normal save
+    await env.resolveConflict('note-h1-int', 'keep-local')
+
+    // Assertions: clean state
+    assert.equal(currentNote.isDirty, false)
+    assert.equal(currentNote.hasConflict, false)
+    assert.equal(currentNote.conflictType, undefined)
+    assert.equal(currentNote.content, 'Important unsaved content')
+
+    // Verify disk file
+    const diskRaw = env.readVaultTextFile('00-Inbox/prod.md')
+    const parsed = extractFrontmatterAndBody(diskRaw)
+    assert.equal(parsed.frontmatter.title, 'Production Data')
+    assert.equal(parsed.frontmatter.project, 'BossBrain')
+    assert.deepEqual(parsed.frontmatter.tags, ['prod'])
+    assert.equal(parsed.body.trim(), 'Important unsaved content')
+  } finally {
+    env.cleanup()
+  }
+})
+
 
 

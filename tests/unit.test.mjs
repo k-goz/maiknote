@@ -1,9 +1,15 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import path from 'node:path'
-import { extractFrontmatterAndBody, stringifyWithFrontmatter } from '../src/utils/frontmatter.ts'
+import {
+  extractFrontmatterAndBody,
+  stringifyWithFrontmatter,
+  buildCanonicalFrontmatter,
+  extractTitle,
+} from '../src/utils/frontmatter.ts'
 import { slugify, generateBossBrainFilename, formatFilenameDate, formatISO8601WithOffset } from '../src/utils/slug.ts'
 import { extractWikilinks, resolveWikilinkTarget, computeBacklinks } from '../src/utils/wikilink.ts'
+import { resolveNoteConflict } from '../src/services/conflictResolver.ts'
 
 // --- UNIT Tests ---
 
@@ -135,3 +141,134 @@ test('[UNIT] 7. [F3-03] Timezone-independent filename format invariant', () => {
   const iso = formatISO8601WithOffset(date)
   assert.match(iso, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/)
 })
+
+test('[UNIT] 8. [H2] Title change preserves unknown frontmatter and prioritizes note state', () => {
+  // Original Markdown with custom field
+  const originalMarkdown = `---
+title: New Note
+project: HealthTwin
+custom_field: preserve-me
+---
+
+# New Note
+`
+  const { frontmatter: oldFm } = extractFrontmatterAndBody(originalMarkdown)
+  assert.equal(oldFm.title, 'New Note')
+  assert.equal(oldFm.custom_field, 'preserve-me')
+
+  // App modifies body to '# HealthTwin 产品架构'
+  const newBody = '# HealthTwin 产品架构\n\nDetailed system architecture content.'
+  const newTitle = extractTitle(newBody)
+  assert.equal(newTitle, 'HealthTwin 产品架构')
+
+  // Construct note in memory
+  const note = {
+    id: 'note-h2-title',
+    title: newTitle,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    frontmatter: oldFm,
+    content: newBody,
+  }
+
+  // Canonical frontmatter merge
+  const mergedFm = buildCanonicalFrontmatter(note, note.frontmatter)
+  const savedMarkdown = stringifyWithFrontmatter(mergedFm, note.content)
+
+  // Re-read Markdown
+  const reRead = extractFrontmatterAndBody(savedMarkdown)
+  assert.equal(reRead.frontmatter.title, 'HealthTwin 产品架构', 'Title must be updated to Note state')
+  assert.equal(reRead.frontmatter.custom_field, 'preserve-me', 'Unknown custom field must be preserved')
+  assert.equal(reRead.frontmatter.project, 'HealthTwin')
+})
+
+test('[UNIT] 9. [H2] In-memory Project and Tags take strict precedence over outdated Frontmatter', () => {
+  const oldFrontmatter = {
+    id: 'note-h2-tags',
+    title: 'Architecture Overview',
+    project: 'OldProject',
+    tags: ['old'],
+    custom_attribute: 42,
+  }
+
+  const note = {
+    id: 'note-h2-tags',
+    title: 'Architecture Overview',
+    project: 'BossBrain',
+    tags: ['memory', 'ai'],
+    frontmatter: oldFrontmatter,
+    content: 'Body content',
+  }
+
+  const merged = buildCanonicalFrontmatter(note, note.frontmatter)
+  assert.equal(merged.project, 'BossBrain', 'In-memory project must override old frontmatter')
+  assert.deepEqual(merged.tags, ['memory', 'ai'], 'In-memory tags must override old frontmatter')
+  assert.equal(merged.custom_attribute, 42, 'Non-canonical fields must remain preserved')
+})
+
+test('[UNIT] 10. [H1] Transactional conflict save: callback throw maintains dirty and conflict flags', async () => {
+  const note = {
+    id: 'note-h1-tx',
+    title: 'Critical Strategy',
+    content: 'Important unsaved content',
+    relativePath: '00-Inbox/critical-strategy.md',
+    hasConflict: true,
+    conflictType: 'modified',
+    conflictContent: 'Disk content from external editor',
+    diskState: 'normal',
+    isDirty: true,
+    frontmatter: {
+      id: 'note-h1-tx',
+      title: 'Critical Strategy',
+      project: 'BossBrain',
+      tags: ['strategy'],
+      source: 'maiknote',
+    },
+  }
+
+  let shouldThrow = true
+  let saveAttemptCount = 0
+
+  const callbacks = {
+    saveNote: async (targetNote) => {
+      saveAttemptCount++
+      if (shouldThrow) {
+        throw new Error('Simulated disk write failure (EACCES / out of space)')
+      }
+      // Successful write
+      targetNote.frontmatter = buildCanonicalFrontmatter(targetNote, targetNote.frontmatter)
+    },
+    createRecoveredNote: async () => {},
+    deleteFromMemory: () => {},
+  }
+
+  // 1. Attempt keep-local with simulated failure
+  await assert.rejects(
+    async () => {
+      await resolveNoteConflict(note, 'keep-local', callbacks)
+    },
+    /Simulated disk write failure/
+  )
+
+  // Assertions: content must not be lost, flags must remain dirty & conflicted
+  assert.equal(note.content, 'Important unsaved content', 'Content must be preserved on write failure')
+  assert.equal(note.isDirty, true, 'Note must remain isDirty = true on write failure')
+  assert.equal(note.hasConflict, true, 'Note must remain hasConflict = true on write failure')
+  assert.equal(note.conflictType, 'modified', 'Conflict type must be preserved')
+  assert.equal(note.conflictContent, 'Disk content from external editor', 'Conflict content must be preserved')
+  assert.equal(saveAttemptCount, 1)
+
+  // 2. Restore healthy disk write conditions and resolve again
+  shouldThrow = false
+  await resolveNoteConflict(note, 'keep-local', callbacks)
+
+  // Assertions after successful resolution
+  assert.equal(saveAttemptCount, 2)
+  assert.equal(note.isDirty, false, 'Note must be isDirty = false after successful save')
+  assert.equal(note.hasConflict, false, 'hasConflict must be false after successful save')
+  assert.equal(note.conflictType, undefined, 'conflictType must be cleared')
+  assert.equal(note.content, 'Important unsaved content', 'Content safely preserved')
+  assert.equal(note.frontmatter.project, 'BossBrain')
+  assert.deepEqual(note.frontmatter.tags, ['strategy'])
+})
+

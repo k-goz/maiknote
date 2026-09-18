@@ -14,6 +14,7 @@ import {
 import {
   extractFrontmatterAndBody,
   stringifyWithFrontmatter,
+  buildCanonicalFrontmatter,
 } from '@/utils/frontmatter'
 import { resolveWikilinkTarget } from '@/utils/wikilink'
 import { diffVaultSnapshot, mergeScannedWithPreservedNotes } from '@/services/vaultChangeDetector'
@@ -314,21 +315,7 @@ export const useNoteStore = defineStore('note', () => {
     try {
       if (settingStore.settings.enableBossBrain && settingStore.settings.vaultPath && note.relativePath) {
         const vaultPath = settingStore.settings.vaultPath
-        const frontmatter: BossBrainFrontmatter = {
-          id: note.id,
-          title: note.title,
-          created: formatISO8601WithOffset(new Date(note.createdAt)),
-          type: note.type || 'note',
-          status: note.status || 'inbox',
-          project: note.project || '',
-          tags: note.tags || [],
-          source: note.source || 'maiknote',
-          ...(note.frontmatter || {}),
-          updated: formatISO8601WithOffset(new Date(note.updatedAt || Date.now())),
-          isPinned: note.isPinned,
-          isLocked: note.isLocked,
-          backgroundColor: note.backgroundColor,
-        }
+        const frontmatter = buildCanonicalFrontmatter(note, note.frontmatter)
         note.frontmatter = frontmatter
         const fullMarkdown = stringifyWithFrontmatter(frontmatter, note.content)
         const writeRes = await fs.writeVaultTextFile(vaultPath, note.relativePath, fullMarkdown)

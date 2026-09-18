@@ -607,6 +607,16 @@ function handleWikilinkClick(target: string) {
   }
 }
 
+async function handleConflictResolve(choice: 'keep-local' | 'keep-disk' | 'conflict-copy') {
+  if (!currentNote.value) return
+  try {
+    await noteStore.resolveConflict(currentNote.value.id, choice)
+  } catch (err: any) {
+    console.error('Failed to resolve conflict:', err)
+    showToast(`解决冲突保存失败: ${err?.message || err}`)
+  }
+}
+
 // 处理源码模式下的输入事件，确保内容实时同步
 function handleSourceInput(e: Event) {
   const target = e.target as HTMLTextAreaElement
@@ -702,11 +712,11 @@ function handleToggleSourceMode() {
           <span v-else>检测到外部 AI / 编辑器修改了该笔记，与本地未保存编辑冲突</span>
         </div>
         <div class="conflict-btns">
-          <button class="conflict-btn local" @click="currentNote && noteStore.resolveConflict(currentNote.id, 'keep-local')">保留本地编辑</button>
-          <button class="conflict-btn external" @click="currentNote && noteStore.resolveConflict(currentNote.id, 'keep-disk')">
+          <button class="conflict-btn local" @click="handleConflictResolve('keep-local')">保留本地编辑</button>
+          <button class="conflict-btn external" @click="handleConflictResolve('keep-disk')">
             {{ currentNote?.conflictType === 'deleted' ? '接受外部删除' : '使用外部版本' }}
           </button>
-          <button class="conflict-btn copy" @click="currentNote && noteStore.resolveConflict(currentNote.id, 'conflict-copy')">另存副本</button>
+          <button class="conflict-btn copy" @click="handleConflictResolve('conflict-copy')">另存副本</button>
         </div>
       </div>
 

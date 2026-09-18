@@ -23,14 +23,33 @@ export async function resolveNoteConflict(
   const isDeletedConflict = note.conflictType === 'deleted' || note.diskState === 'missing'
 
   if (choice === 'keep-local') {
-    note.hasConflict = false
-    note.conflictType = undefined
-    note.conflictContent = undefined
-    note.diskState = 'normal'
-    note.isDirty = false
+    // H1: Transactional safety. Preserve state before write attempt.
+    const prevHasConflict = note.hasConflict ?? true
+    const prevConflictType = note.conflictType
+    const prevConflictContent = note.conflictContent
+    const prevDiskState = note.diskState
+    const prevIsDirty = note.isDirty ?? true
+
     note.updatedAt = Date.now()
-    if (note.relativePath) {
-      await callbacks.saveNote(note)
+
+    try {
+      if (note.relativePath) {
+        await callbacks.saveNote(note)
+      }
+      // Clean conflict & dirty flags only AFTER successful persistence
+      note.hasConflict = false
+      note.conflictType = undefined
+      note.conflictContent = undefined
+      note.diskState = 'normal'
+      note.isDirty = false
+    } catch (err) {
+      // On failure: strictly preserve unpersisted state and rethrow for UI feedback
+      note.isDirty = prevIsDirty !== undefined ? prevIsDirty : true
+      note.hasConflict = prevHasConflict !== undefined ? prevHasConflict : true
+      note.conflictType = prevConflictType
+      note.conflictContent = prevConflictContent
+      note.diskState = prevDiskState
+      throw err
     }
   } else if (choice === 'keep-disk') {
     if (isDeletedConflict) {
