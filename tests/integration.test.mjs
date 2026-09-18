@@ -3,33 +3,11 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
-import { load, dump } from 'js-yaml'
+import { extractFrontmatterAndBody, stringifyWithFrontmatter } from '../src/utils/frontmatter.ts'
+import { diffVaultSnapshot, mergeScannedWithPreservedNotes } from '../src/services/vaultChangeDetector.ts'
+import { resolveNoteConflict } from '../src/services/conflictResolver.ts'
 
-function extractFrontmatterAndBody(content) {
-  const FRONTMATTER_REGEX = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/
-  const trimmed = content || ''
-  const match = trimmed.match(FRONTMATTER_REGEX)
-  if (!match) return { frontmatter: {}, body: trimmed, hasFrontmatter: false }
-  const yamlText = match[1]
-  const body = trimmed.slice(match[0].length).replace(/^\r?\n/, '')
-  try {
-    const parsed = load(yamlText)
-    if (parsed && typeof parsed === 'object') return { frontmatter: parsed, body, hasFrontmatter: true }
-  } catch {}
-  return { frontmatter: {}, body: trimmed, hasFrontmatter: false }
-}
-
-function stringifyWithFrontmatter(frontmatter, body) {
-  const cleanFm = {}
-  for (const [key, val] of Object.entries(frontmatter)) {
-    if (val !== undefined && val !== null) cleanFm[key] = val
-  }
-  if (Object.keys(cleanFm).length === 0) return body || ''
-  const yamlStr = dump(cleanFm, { lineWidth: -1, noRefs: true, forceQuotes: false }).trim()
-  return `---\n${yamlStr}\n---\n\n${body !== undefined ? body : ''}`
-}
-
-// Simulated Store & FileSystem for Integration Tests
+// Simulated Store & FileSystem for Integration Tests using production services
 class MockVaultEnvironment {
   constructor() {
     this.vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bossbrain-integration-'))
@@ -82,28 +60,9 @@ class MockVaultEnvironment {
     fs.unlinkSync(path.join(this.vaultDir, relPath))
   }
 
-  // Corresponds to rescanVault logic in noteStore.ts
+  // Corresponds to rescanVault logic in noteStore.ts using mergeScannedWithPreservedNotes
   async rescanVault(forceRebuild = false) {
     const files = this.scanVaultFiles().filter(f => !f.relative_path.startsWith('.bossbrain/'))
-    if (files.length === 0) {
-      this.notes = []
-      this.lastDiskSnapshot.clear()
-      // Create fresh note in 00-Inbox/
-      const freshRel = '00-Inbox/fresh-first-note.md'
-      this.writeVaultTextFile(freshRel, stringifyWithFrontmatter({ id: 'fresh-1', title: 'New Note' }, ''))
-      const stat = fs.statSync(path.join(this.vaultDir, freshRel))
-      this.notes = [{
-        id: 'fresh-1',
-        title: 'New Note',
-        content: '',
-        relativePath: freshRel,
-        mtime: stat.mtimeMs,
-        isDirty: false,
-      }]
-      this.currentNoteId = 'fresh-1'
-      this.lastDiskSnapshot.set(freshRel, { mtime: stat.mtimeMs, size: stat.size })
-      return
-    }
 
     const scanned = []
     for (const f of files) {
@@ -121,29 +80,27 @@ class MockVaultEnvironment {
       })
     }
 
-    const preservedMap = new Map()
-    for (const n of this.notes) {
-      if (n.isDirty || n.hasConflict) {
-        preservedMap.set(n.id, n)
-        if (n.relativePath) preservedMap.set(n.relativePath, n)
-      }
+    const { mergedNotes, isEmptyVault } = mergeScannedWithPreservedNotes(scanned, this.notes)
+    if (isEmptyVault) {
+      this.notes = []
+      this.lastDiskSnapshot.clear()
+      // Create fresh note in 00-Inbox/
+      const freshRel = '00-Inbox/fresh-first-note.md'
+      this.writeVaultTextFile(freshRel, stringifyWithFrontmatter({ id: 'fresh-1', title: 'New Note' }, ''))
+      const stat = fs.statSync(path.join(this.vaultDir, freshRel))
+      this.notes = [{
+        id: 'fresh-1',
+        title: 'New Note',
+        content: '',
+        relativePath: freshRel,
+        mtime: stat.mtimeMs,
+        size: stat.size,
+        isDirty: false,
+      }]
+      this.currentNoteId = 'fresh-1'
+      this.lastDiskSnapshot.set(freshRel, { mtime: stat.mtimeMs, size: stat.size })
+      return
     }
-
-    const mergedNotes = scanned.map(sn => {
-      const preserved = preservedMap.get(sn.id) || (sn.relativePath ? preservedMap.get(sn.relativePath) : undefined)
-      if (preserved) {
-        return {
-          ...sn,
-          content: preserved.content,
-          isDirty: preserved.isDirty,
-          hasConflict: preserved.hasConflict,
-          conflictContent: preserved.conflictContent,
-          frontmatter: preserved.frontmatter,
-          title: preserved.title,
-        }
-      }
-      return sn
-    })
 
     this.notes = mergedNotes
     this.lastDiskSnapshot.clear()
@@ -152,7 +109,7 @@ class MockVaultEnvironment {
     }
   }
 
-  // Corresponds to checkExternalChanges logic in noteStore.ts
+  // Corresponds to checkExternalChanges logic in noteStore.ts using diffVaultSnapshot
   async checkExternalChanges() {
     const files = this.scanVaultFiles()
     const diskFiles = files.filter(f => !f.relative_path.startsWith('.bossbrain/'))
@@ -162,37 +119,8 @@ class MockVaultEnvironment {
       diskSnapshot.set(f.relative_path, { mtime: f.modified_ms, size: f.size })
     }
 
-    let hasAnyDiff = false
-    if (diskSnapshot.size !== this.notes.length) hasAnyDiff = true
-
-    for (const [relPath, diskEntry] of diskSnapshot) {
-      const memNote = this.notes.find(n => n.relativePath === relPath)
-      if (!memNote) {
-        hasAnyDiff = true
-        break
-      }
-      const lastEntry = this.lastDiskSnapshot.get(relPath)
-      if (lastEntry) {
-        if (diskEntry.mtime !== lastEntry.mtime || diskEntry.size !== lastEntry.size) {
-          hasAnyDiff = true
-          break
-        }
-      } else if (memNote.mtime && (diskEntry.mtime > memNote.mtime + 500 || (memNote.size && diskEntry.size !== memNote.size))) {
-        hasAnyDiff = true
-        break
-      }
-    }
-
-    if (!hasAnyDiff) {
-      for (const note of this.notes) {
-        if (note.relativePath && !diskSnapshot.has(note.relativePath)) {
-          hasAnyDiff = true
-          break
-        }
-      }
-    }
-
-    if (!hasAnyDiff) return false
+    const diff = diffVaultSnapshot(diskSnapshot, this.lastDiskSnapshot, this.notes)
+    if (!diff.hasAnyDiff) return false
 
     const current = this.notes.find(n => n.id === this.currentNoteId)
     if (current && current.relativePath) {
@@ -207,6 +135,7 @@ class MockVaultEnvironment {
         const { frontmatter, body } = extractFrontmatterAndBody(raw)
         if (current.isDirty) {
           current.hasConflict = true
+          current.conflictType = 'modified'
           current.conflictContent = body
         } else {
           current.content = body
@@ -222,49 +151,41 @@ class MockVaultEnvironment {
     return true
   }
 
-  // Corresponds to resolveConflict in noteStore.ts
+  // Corresponds to resolveConflict in noteStore.ts using resolveNoteConflict
   async resolveConflict(noteId, choice) {
     const note = this.notes.find(n => n.id === noteId)
     if (!note) return
 
-    if (choice === 'keep-local') {
-      note.hasConflict = false
-      note.conflictContent = undefined
-      note.isDirty = true
-      // Write local content to disk immediately
-      const full = stringifyWithFrontmatter(note.frontmatter || {}, note.content)
-      this.writeVaultTextFile(note.relativePath, full)
-      const stat = fs.statSync(path.join(this.vaultDir, note.relativePath))
-      note.mtime = stat.mtimeMs
-      note.size = stat.size
-      this.lastDiskSnapshot.set(note.relativePath, { mtime: stat.mtimeMs, size: stat.size })
-      note.isDirty = false
-    } else if (choice === 'keep-disk') {
-      if (note.conflictContent !== undefined) {
-        note.content = note.conflictContent
-      }
-      note.hasConflict = false
-      note.conflictContent = undefined
-      note.isDirty = false
-      const stat = fs.statSync(path.join(this.vaultDir, note.relativePath))
-      note.mtime = stat.mtimeMs
-      note.size = stat.size
-      this.lastDiskSnapshot.set(note.relativePath, { mtime: stat.mtimeMs, size: stat.size })
-    } else if (choice === 'conflict-copy') {
-      const copyRel = `00-Inbox/conflict-copy-${Date.now()}.md`
-      const copyFull = stringifyWithFrontmatter({ id: `copy-${Date.now()}`, title: `${note.title} (Conflict Copy)` }, note.content)
-      this.writeVaultTextFile(copyRel, copyFull)
-      if (note.conflictContent !== undefined) {
-        note.content = note.conflictContent
-      }
-      note.hasConflict = false
-      note.conflictContent = undefined
-      note.isDirty = false
-      const stat = fs.statSync(path.join(this.vaultDir, note.relativePath))
-      note.mtime = stat.mtimeMs
-      note.size = stat.size
-      this.lastDiskSnapshot.set(note.relativePath, { mtime: stat.mtimeMs, size: stat.size })
-    }
+    await resolveNoteConflict(note, choice, {
+      writeVaultTextFile: async (relPath, content) => {
+        const full = stringifyWithFrontmatter(note.frontmatter || {}, content)
+        this.writeVaultTextFile(relPath, full)
+        const stat = fs.statSync(path.join(this.vaultDir, relPath))
+        this.lastDiskSnapshot.set(relPath, { mtime: stat.mtimeMs, size: stat.size })
+        return { modified_ms: stat.mtimeMs, size: stat.size }
+      },
+      createNoteWithContent: async (title, content) => {
+        const rel = `00-Inbox/${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Date.now()}.md`
+        const full = stringifyWithFrontmatter({ id: `copy-${Date.now()}`, title }, content)
+        this.writeVaultTextFile(rel, full)
+        const stat = fs.statSync(path.join(this.vaultDir, rel))
+        const newNote = {
+          id: `copy-${Date.now()}`,
+          title,
+          content,
+          relativePath: rel,
+          mtime: stat.mtimeMs,
+          size: stat.size,
+          isDirty: false,
+        }
+        this.notes.push(newNote)
+        this.lastDiskSnapshot.set(rel, { mtime: stat.mtimeMs, size: stat.size })
+        return newNote
+      },
+      deleteFromMemory: (id) => {
+        this.notes = this.notes.filter(n => n.id !== id)
+      },
+    })
   }
 }
 
@@ -470,3 +391,146 @@ test('[INTEGRATION] 7. [F1-07] legacyPath consistency and source immutability', 
   fs.rmSync(customLegacyDir, { recursive: true, force: true })
   fs.rmSync(targetVaultDir, { recursive: true, force: true })
 })
+
+test('[INTEGRATION] 8. [F2-01] External deletion of dirty note does NOT lose local content', async () => {
+  const env = new MockVaultEnvironment()
+  try {
+    env.writeVaultTextFile('00-Inbox/A.md', stringifyWithFrontmatter({ id: 'note-A', title: 'Note A' }, 'Disk V1'))
+    await env.rescanVault()
+    env.currentNoteId = 'note-A'
+
+    const noteA = env.notes.find(n => n.id === 'note-A')
+    // User types local edits (isDirty = true)
+    noteA.content = 'Important Local Unsaved Work'
+    noteA.isDirty = true
+
+    // External AI / Obsidian deletes A.md on disk
+    env.deleteVaultFile('00-Inbox/A.md')
+
+    // System detects change or rescans
+    await env.checkExternalChanges()
+
+    // Note A must NOT be removed; must have conflictType = 'deleted' and diskState = 'missing'
+    assert.equal(env.notes.length, 1, 'Dirty note must not be removed on external deletion')
+    const preserved = env.notes.find(n => n.id === 'note-A')
+    assert.ok(preserved)
+    assert.equal(preserved.content, 'Important Local Unsaved Work')
+    assert.equal(preserved.isDirty, true)
+    assert.equal(preserved.hasConflict, true)
+    assert.equal(preserved.conflictType, 'deleted')
+    assert.equal(preserved.diskState, 'missing')
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('[INTEGRATION] 9. [F2-01 Branch 1] Deleted dirty note conflict resolution: keep-local recreates file on disk', async () => {
+  const env = new MockVaultEnvironment()
+  try {
+    env.writeVaultTextFile('00-Inbox/A.md', stringifyWithFrontmatter({ id: 'note-A', title: 'Note A' }, 'Disk V1'))
+    await env.rescanVault()
+
+    const noteA = env.notes.find(n => n.id === 'note-A')
+    noteA.content = 'Recovered Local Work'
+    noteA.isDirty = true
+    noteA.hasConflict = true
+    noteA.conflictType = 'deleted'
+    noteA.diskState = 'missing'
+
+    // User chooses keep-local (re-save to disk)
+    await env.resolveConflict('note-A', 'keep-local')
+
+    assert.equal(noteA.hasConflict, false)
+    assert.equal(noteA.diskState, 'normal')
+    assert.equal(noteA.isDirty, false)
+    assert.equal(noteA.content, 'Recovered Local Work')
+
+    // Verify file is recreated on disk
+    assert.ok(fs.existsSync(path.join(env.vaultDir, '00-Inbox/A.md')))
+    const diskContent = env.readVaultTextFile('00-Inbox/A.md')
+    assert.ok(diskContent.includes('Recovered Local Work'))
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('[INTEGRATION] 10. [F2-01 Branch 2] Deleted dirty note conflict resolution: keep-disk accepts external deletion', async () => {
+  const env = new MockVaultEnvironment()
+  try {
+    env.writeVaultTextFile('00-Inbox/A.md', stringifyWithFrontmatter({ id: 'note-A', title: 'Note A' }, 'Disk V1'))
+    await env.rescanVault()
+
+    const noteA = env.notes.find(n => n.id === 'note-A')
+    noteA.content = 'Discarded Local Work'
+    noteA.isDirty = true
+    noteA.hasConflict = true
+    noteA.conflictType = 'deleted'
+    noteA.diskState = 'missing'
+
+    // User chooses keep-disk (accept deletion)
+    await env.resolveConflict('note-A', 'keep-disk')
+
+    // Note is safely removed from memory
+    assert.equal(env.notes.length, 0)
+    assert.ok(!env.notes.some(n => n.id === 'note-A'))
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('[INTEGRATION] 11. [F2-01 Branch 3] Deleted dirty note conflict resolution: conflict-copy saves recovered note', async () => {
+  const env = new MockVaultEnvironment()
+  try {
+    env.writeVaultTextFile('00-Inbox/A.md', stringifyWithFrontmatter({ id: 'note-A', title: 'Note A' }, 'Disk V1'))
+    await env.rescanVault()
+
+    const noteA = env.notes.find(n => n.id === 'note-A')
+    noteA.content = 'Local Content Saved As Copy'
+    noteA.isDirty = true
+    noteA.hasConflict = true
+    noteA.conflictType = 'deleted'
+    noteA.diskState = 'missing'
+
+    // User chooses conflict-copy
+    await env.resolveConflict('note-A', 'conflict-copy')
+
+    // The missing note is closed/removed from memory
+    assert.ok(!env.notes.some(n => n.id === 'note-A'))
+
+    // But a new recovered note is created on disk in 00-Inbox/
+    const files = env.scanVaultFiles().filter(f => f.relative_path.includes('recovered'))
+    assert.equal(files.length, 1)
+    const copyContent = env.readVaultTextFile(files[0].relative_path)
+    assert.ok(copyContent.includes('Local Content Saved As Copy'))
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('[INTEGRATION] 12. [F2-02] Empty vault on disk does NOT wipe dirty/conflicted notes', async () => {
+  const env = new MockVaultEnvironment()
+  try {
+    env.writeVaultTextFile('00-Inbox/A.md', stringifyWithFrontmatter({ id: 'note-A', title: 'Note A' }, 'Disk V1'))
+    await env.rescanVault()
+
+    const noteA = env.notes.find(n => n.id === 'note-A')
+    noteA.content = 'User Still Editing This'
+    noteA.isDirty = true
+
+    // External agent empties the whole vault
+    env.deleteVaultFile('00-Inbox/A.md')
+
+    // Rescan vault
+    await env.rescanVault()
+
+    // Note A must NOT be replaced by a dummy empty note; dirty note remains preserved with conflict
+    assert.equal(env.notes.length, 1)
+    assert.equal(env.notes[0].id, 'note-A')
+    assert.equal(env.notes[0].content, 'User Still Editing This')
+    assert.equal(env.notes[0].diskState, 'missing')
+    assert.equal(env.notes[0].hasConflict, true)
+  } finally {
+    env.cleanup()
+  }
+})
+

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'bossbrain/**'
+  pull_request:
+    branches:
+      - main
+      - 'bossbrain/**'
+
+jobs:
+  test-and-build:
+    name: Test & Build (Frontend & Tauri Rust)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Tests (Unit & Integration)
+        run: npm test
+
+      - name: TypeScript & Frontend Build
+        run: npm run build
+
+      - name: Rust Cargo Check
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Rust Unit Tests (Vault & Symlink Defense)
+        run: cargo test --manifest-path src-tauri/Cargo.toml

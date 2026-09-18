@@ -34,6 +34,7 @@ import TableRow from '@tiptap/extension-table-row'
 import TableCell from '@tiptap/extension-table-cell'
 import TableHeader from '@tiptap/extension-table-header'
 import { TextSelection, AllSelection } from 'prosemirror-state'
+import { useNoteStore } from '@/stores/noteStore'
 import { useFileSystem } from '@/composables/useFileSystem'
 import { useI18n } from 'vue-i18n'
 import { SOURCE_TAB_INSERT_TEXT, createRichTabInsertText } from './tabInsert'
@@ -42,8 +43,17 @@ const lowlight = createLowlight(all)
 
 const settingStore = useSettingStore()
 const assistantsStore = useAssistantsStore()
+const noteStore = useNoteStore()
 const fileSystem = useFileSystem()
 const { t } = useI18n()
+
+const computeVaultRelativeAssetPath = (filename: string): string => {
+  const relPath = noteStore.currentNote?.relativePath || ''
+  const parts = relPath.split('/').filter(Boolean)
+  const depth = parts.length > 1 ? parts.length - 1 : 0
+  const prefix = depth > 0 ? '../'.repeat(depth) : ''
+  return `${prefix}_assets/${filename}`
+}
 
 type TextAlignValue = 'left' | 'center' | 'right'
 
@@ -889,9 +899,22 @@ const editor = useEditor({
     Placeholder.configure({
       placeholder: ''
     }),
-    Image.configure({
+    Image.extend({
+      addAttributes() {
+        return {
+          ...this.parent?.(),
+          displaySrc: {
+            default: null,
+          },
+        }
+      },
+      renderHTML({ HTMLAttributes }) {
+        const { displaySrc, ...attrs } = HTMLAttributes
+        return ['img', { ...attrs, src: displaySrc || attrs.src }]
+      },
+    }).configure({
       inline: true,
-      allowBase64: false, // 禁用 base64，改为保存到文件
+      allowBase64: true,
     }),
     Link.configure({
       openOnClick: false,
@@ -1240,12 +1263,26 @@ const editor = useEditor({
               const ext = item.type.split('/')[1] || 'png'
               const filename = `img_${timestamp}_${randomStr}.${ext}`
 
-              // 保存图片到 iCloud 的 images 文件夹
-              const relativePath = await fileSystem.saveImage(dataUrl, filename)
+              const isBossBrain = settingStore.settings.enableBossBrain && !!settingStore.settings.vaultPath
+              const customVaultPath = isBossBrain ? settingStore.settings.vaultPath : undefined
 
-              // 插入图片到编辑器（relativePath 已经是 asset:// URL）
-              const imageNode = view.state.schema.nodes.image.create({ src: relativePath, alt: '', title: '' })
-              view.dispatch(view.state.tr.replaceSelectionWith(imageNode))
+              if (customVaultPath) {
+                const relAssetPath = computeVaultRelativeAssetPath(filename)
+                const returnedDataUrl = await fileSystem.saveImage(dataUrl, filename, customVaultPath)
+                const imageNode = view.state.schema.nodes.image.create({
+                  src: relAssetPath,
+                  displaySrc: returnedDataUrl || dataUrl,
+                  alt: '',
+                  title: '',
+                })
+                view.dispatch(view.state.tr.replaceSelectionWith(imageNode))
+              } else {
+                // 保存图片到 iCloud 的 images 文件夹
+                const relativePath = await fileSystem.saveImage(dataUrl, filename)
+                // 插入图片到编辑器（relativePath 已经是 asset:// URL）
+                const imageNode = view.state.schema.nodes.image.create({ src: relativePath, alt: '', title: '' })
+                view.dispatch(view.state.tr.replaceSelectionWith(imageNode))
+              }
             } catch (err) {
               console.error('Failed to save image:', err)
               showToast(t('toast.imageSaveFailed'))
@@ -1324,12 +1361,26 @@ const editor = useEditor({
             const ext = file.type.split('/')[1] || 'png'
             const filename = `img_${timestamp}_${randomStr}.${ext}`
 
-            // 保存图片到 iCloud 的 images 文件夹
-            const relativePath = await fileSystem.saveImage(dataUrl, filename)
+            const isBossBrain = settingStore.settings.enableBossBrain && !!settingStore.settings.vaultPath
+            const customVaultPath = isBossBrain ? settingStore.settings.vaultPath : undefined
 
-            // 插入图片到编辑器（relativePath 已经是完整的 file:// URL）
-            const imageNode = view.state.schema.nodes.image.create({ src: relativePath, alt: '', title: '' })
-            view.dispatch(view.state.tr.replaceSelectionWith(imageNode))
+            if (customVaultPath) {
+              const relAssetPath = computeVaultRelativeAssetPath(filename)
+              const returnedDataUrl = await fileSystem.saveImage(dataUrl, filename, customVaultPath)
+              const imageNode = view.state.schema.nodes.image.create({
+                src: relAssetPath,
+                displaySrc: returnedDataUrl || dataUrl,
+                alt: '',
+                title: '',
+              })
+              view.dispatch(view.state.tr.replaceSelectionWith(imageNode))
+            } else {
+              // 保存图片到 iCloud 的 images 文件夹
+              const relativePath = await fileSystem.saveImage(dataUrl, filename)
+              // 插入图片到编辑器（relativePath 已经是完整的 file:// URL）
+              const imageNode = view.state.schema.nodes.image.create({ src: relativePath, alt: '', title: '' })
+              view.dispatch(view.state.tr.replaceSelectionWith(imageNode))
+            }
           } catch (err) {
             console.error('Failed to save image:', err)
             showToast(t('toast.imageSaveFailed'))
@@ -1474,9 +1525,36 @@ onMounted(async () => {
       }
     }
   })
+
+  // 监听并处理 _assets/ 本地相对图片加载
+  document.addEventListener('error', handleImageError, true)
 })
 
+const handleImageError = async (e: Event) => {
+  const target = e.target as HTMLElement
+  if (target && target.tagName === 'IMG') {
+    const img = target as HTMLImageElement
+    const rawSrc = img.getAttribute('src') || ''
+    if (rawSrc.startsWith('_assets/') || rawSrc.includes('/_assets/')) {
+      const cleanRelPath = rawSrc.replace(/^(\.\.\/)+/, '').replace(/^\.\//, '')
+      try {
+        const isBossBrain = settingStore.settings.enableBossBrain && !!settingStore.settings.vaultPath
+        const customVaultPath = isBossBrain ? settingStore.settings.vaultPath : undefined
+        if (customVaultPath) {
+          const dataUrl = await fileSystem.readVaultAsset(customVaultPath, cleanRelPath)
+          if (dataUrl) {
+            img.src = dataUrl
+          }
+        }
+      } catch (err) {
+        console.warn('Failed to load vault asset on error:', cleanRelPath, err)
+      }
+    }
+  }
+}
+
 onUnmounted(() => {
+  document.removeEventListener('error', handleImageError, true)
   if (imeUpdateTimer) {
     clearTimeout(imeUpdateTimer)
     imeUpdateTimer = null

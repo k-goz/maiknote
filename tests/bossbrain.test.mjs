@@ -3,146 +3,9 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
-import { load, dump } from 'js-yaml'
-
-// --- Unit under test imports / definitions matching src/utils ---
-
-function extractFrontmatterAndBody(content) {
-  const FRONTMATTER_REGEX = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/
-  const trimmed = content || ''
-  const match = trimmed.match(FRONTMATTER_REGEX)
-
-  if (!match) {
-    return { frontmatter: {}, body: trimmed, hasFrontmatter: false }
-  }
-
-  const yamlText = match[1]
-  const body = trimmed.slice(match[0].length)
-
-  try {
-    const parsed = load(yamlText)
-    if (parsed && typeof parsed === 'object') {
-      return { frontmatter: parsed, body, hasFrontmatter: true }
-    }
-  } catch (err) {
-    // fallback
-  }
-
-  return { frontmatter: {}, body: trimmed, hasFrontmatter: false }
-}
-
-function stringifyWithFrontmatter(frontmatter, body) {
-  const cleanFm = {}
-  for (const [key, val] of Object.entries(frontmatter)) {
-    if (val !== undefined && val !== null) {
-      cleanFm[key] = val
-    }
-  }
-
-  if (Object.keys(cleanFm).length === 0) {
-    return body || ''
-  }
-
-  const yamlStr = dump(cleanFm, {
-    lineWidth: -1,
-    noRefs: true,
-    forceQuotes: false,
-  }).trim()
-
-  const trimmedBody = body !== undefined ? body : ''
-  return `---\n${yamlStr}\n---\n\n${trimmedBody}`
-}
-
-function slugify(text) {
-  if (!text) return 'untitled'
-  let cleaned = text.replace(/^[#*>\-\s]+/, '').trim()
-  cleaned = cleaned.split('\n')[0].trim()
-  const slug = cleaned
-    .toLowerCase()
-    .replace(/[^\w\u4e00-\u9fa5\u3040-\u30ff\uac00-\ud7af-]+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '')
-  return slug.substring(0, 40) || 'untitled'
-}
-
-function generateBossBrainFilename(title, date = new Date()) {
-  const y = date.getFullYear()
-  const m = String(date.getMonth() + 1).padStart(2, '0')
-  const d = String(date.getDate()).padStart(2, '0')
-  const h = String(date.getHours()).padStart(2, '0')
-  const min = String(date.getMinutes()).padStart(2, '0')
-  const datePrefix = `${y}-${m}-${d}-${h}${min}`
-  const slug = slugify(title)
-  return `${datePrefix}--${slug}-a82c.md`
-}
-
-function extractWikilinks(content) {
-  if (!content) return []
-  const WIKILINK_REGEX = /\[\[([^\]|#]+)(?:#([^\]|]+))?(?:\|([^\]]+))?\]\]/g
-  const links = []
-  const matches = content.matchAll(WIKILINK_REGEX)
-  for (const m of matches) {
-    links.push({
-      raw: m[0],
-      target: m[1].trim(),
-      heading: m[2]?.trim(),
-      alias: m[3]?.trim(),
-    })
-  }
-  return links
-}
-
-function resolveWikilinkTarget(target, notes) {
-  if (!target) return null
-  const norm = target.trim().toLowerCase().replace(/[-_\s]+/g, ' ')
-
-  // 1 & 2: Title match
-  const titleMatch = notes.find(n => n.title.trim().toLowerCase().replace(/[-_\s]+/g, ' ') === norm)
-  if (titleMatch) return titleMatch
-
-  // 3: ID match
-  const idMatch = notes.find(n => n.id === target || n.id.toLowerCase() === norm)
-  if (idMatch) return idMatch
-
-  // 4: Alias match
-  const aliasMatch = notes.find(n => {
-    const aliases = n.frontmatter?.aliases
-    return Array.isArray(aliases) && aliases.some(a => String(a).trim().toLowerCase() === norm)
-  })
-  if (aliasMatch) return aliasMatch
-
-  // 5: File match
-  const fileMatch = notes.find(n => {
-    if (!n.relativePath) return false
-    const base = n.relativePath.split('/').pop().replace(/\.md$/i, '')
-    return base.toLowerCase().includes(norm)
-  })
-  if (fileMatch) return fileMatch
-
-  return null
-}
-
-function computeBacklinks(notes) {
-  const map = new Map()
-  for (const n of notes) {
-    map.set(n.id, new Set())
-  }
-  for (const note of notes) {
-    const links = extractWikilinks(note.content)
-    for (const link of links) {
-      const targetNote = resolveWikilinkTarget(link.target, notes)
-      if (targetNote && targetNote.id !== note.id) {
-        if (!map.has(targetNote.id)) map.set(targetNote.id, new Set())
-        map.get(targetNote.id).add(note.id)
-      }
-    }
-  }
-  const result = new Map()
-  for (const [id, set] of map.entries()) {
-    result.set(id, Array.from(set))
-  }
-  return result
-}
+import { extractFrontmatterAndBody, stringifyWithFrontmatter } from '../src/utils/frontmatter.ts'
+import { slugify, generateBossBrainFilename, formatFilenameDate, formatISO8601WithOffset } from '../src/utils/slug.ts'
+import { extractWikilinks, resolveWikilinkTarget, computeBacklinks } from '../src/utils/wikilink.ts'
 
 // --- Test Suites ---
 
@@ -176,7 +39,7 @@ test('1. YAML Frontmatter Parse & Stringify', () => {
 test('2. Slug and Filename Generation', () => {
   const title = 'HealthTwin 首页应该加强 CTA'
   const filename = generateBossBrainFilename(title, new Date(2026, 8, 17, 23, 42))
-  assert.equal(filename, '2026-09-17-2342--healthtwin-首页应该加强-cta-a82c.md')
+  assert.match(filename, /^2026-09-17-2342--healthtwin-首页应该加强-cta-[0-9a-f]{4}\.md$/)
 })
 
 test('3. Wikilinks Extraction and Disambiguation', () => {

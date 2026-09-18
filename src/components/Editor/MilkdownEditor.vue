@@ -694,16 +694,19 @@ function handleToggleSourceMode() {
     </Transition>
 
     <div class="editor-wrapper">
-      <!-- 外部 AI 修改冲突提示横幅 -->
+      <!-- 外部 AI 修改/删除冲突提示横幅 -->
       <div v-if="currentNote?.hasConflict" class="conflict-banner">
         <div class="conflict-msg">
           <i class="i-mdi-alert-circle"></i>
-          <span>检测到外部 AI / 编辑器修改了该笔记，与本地未保存编辑冲突</span>
+          <span v-if="currentNote?.conflictType === 'deleted'">检测到外部删除了该笔记文件，本地持有未保存草稿</span>
+          <span v-else>检测到外部 AI / 编辑器修改了该笔记，与本地未保存编辑冲突</span>
         </div>
         <div class="conflict-btns">
-          <button class="conflict-btn external" @click="currentNote && noteStore.resolveConflict(currentNote.id, 'keep-disk')">使用外部版本</button>
           <button class="conflict-btn local" @click="currentNote && noteStore.resolveConflict(currentNote.id, 'keep-local')">保留本地编辑</button>
-          <button class="conflict-btn copy" @click="currentNote && noteStore.resolveConflict(currentNote.id, 'conflict-copy')">另存冲突副本</button>
+          <button class="conflict-btn external" @click="currentNote && noteStore.resolveConflict(currentNote.id, 'keep-disk')">
+            {{ currentNote?.conflictType === 'deleted' ? '接受外部删除' : '使用外部版本' }}
+          </button>
+          <button class="conflict-btn copy" @click="currentNote && noteStore.resolveConflict(currentNote.id, 'conflict-copy')">另存副本</button>
         </div>
       </div>
 

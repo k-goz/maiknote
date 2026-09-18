@@ -26,6 +26,8 @@ export interface Note {
   isDirty?: boolean // Has unpersisted local changes
   hasConflict?: boolean // External change detected while local note is dirty
   conflictContent?: string // Disk content when conflict occurred
+  conflictType?: 'modified' | 'deleted' // Nature of the external conflict
+  diskState?: 'normal' | 'missing' // Whether disk file exists or was deleted/moved
 }
 
 export interface BossBrainFrontmatter {
