@@ -24,11 +24,11 @@ export function useFileSystem() {
   }
 
   /**
-   * Read metadata.json file
+   * Read metadata.json file (optionally from a custom legacy path)
    */
-  async function readMetadata(): Promise<NoteMetadata> {
+  async function readMetadata(customPath?: string): Promise<NoteMetadata> {
     try {
-      const path = await getICloudPath()
+      const path = customPath || await getICloudPath()
       const content = await safeInvoke<string>('read_metadata', { basePath: path })
       return JSON.parse(content)
     } catch (e) {
@@ -55,11 +55,11 @@ export function useFileSystem() {
   }
 
   /**
-   * Read a single note file (optionally from a directory folder)
+   * Read a single note file (optionally from a directory folder, optionally from custom path)
    */
-  async function readNote(id: string, dir?: string): Promise<string> {
+  async function readNote(id: string, dir?: string, customPath?: string): Promise<string> {
     try {
-      const path = await getICloudPath()
+      const path = customPath || await getICloudPath()
       const args: Record<string, unknown> = { basePath: path, id }
       if (dir) args.dir = dir
       return await safeInvoke<string>('read_note', args)
@@ -191,12 +191,22 @@ export function useFileSystem() {
    * @param filename Filename to save as
    * @returns Asset protocol URL for the saved image
    */
-  async function saveImage(imageData: string, filename: string): Promise<string> {
+  /**
+   * Save image file
+   * In Boss Brain mode: saves to <vaultPath>/_assets/ and returns Data URL for display
+   * In legacy mode: saves to <iCloudPath>/images/ and returns asset:// URL
+   */
+  async function saveImage(imageData: string, filename: string, customVaultPath?: string): Promise<string> {
     try {
+      if (customVaultPath) {
+        const relativePath = `_assets/${filename}`
+        await safeInvoke('save_vault_asset', { vaultPath: customVaultPath, relativePath, imageData })
+        return await safeInvoke<string>('read_vault_asset', { vaultPath: customVaultPath, relativePath })
+      }
+
       const path = await getICloudPath()
       await safeInvoke<string>('save_image', { basePath: path, imageData, filename })
       // Return asset:// URL for Tauri to serve the file
-      // Ensure proper URL encoding and single slash after localhost
       const encodedPath = encodeURIComponent(`${path}/images/${filename}`)
       return `asset://localhost/${encodedPath}`
     } catch (e) {
@@ -235,6 +245,65 @@ export function useFileSystem() {
     }
   }
 
+  // ============================================
+  // Boss Brain Vault Operations
+  // ============================================
+
+  async function getDefaultVaultPath(): Promise<string> {
+    try {
+      return await safeInvoke<string>('get_default_vault_path')
+    } catch (e) {
+      console.error('Failed to get default vault path:', e)
+      return ''
+    }
+  }
+
+  async function ensureVaultStructure(vaultPath: string): Promise<void> {
+    try {
+      await safeInvoke('ensure_vault_structure', { vaultPath })
+    } catch (e) {
+      console.error('Failed to ensure vault structure:', e)
+      throw e
+    }
+  }
+
+  async function scanVaultFiles(vaultPath: string): Promise<Array<{ relative_path: string; modified_ms: number; size: number }>> {
+    try {
+      return await safeInvoke('scan_vault_files', { vaultPath })
+    } catch (e) {
+      console.error('Failed to scan vault files:', e)
+      return []
+    }
+  }
+
+  async function readVaultTextFile(vaultPath: string, relativePath: string): Promise<string> {
+    return await safeInvoke<string>('read_vault_text_file', { vaultPath, relativePath })
+  }
+
+  async function writeVaultTextFile(vaultPath: string, relativePath: string, content: string): Promise<{ modified_ms: number; size: number }> {
+    return await safeInvoke<{ modified_ms: number; size: number }>('write_vault_text_file', { vaultPath, relativePath, content })
+  }
+
+  async function saveVaultAsset(vaultPath: string, relativePath: string, imageData: string): Promise<{ modified_ms: number; size: number }> {
+    return await safeInvoke<{ modified_ms: number; size: number }>('save_vault_asset', { vaultPath, relativePath, imageData })
+  }
+
+  async function readVaultAsset(vaultPath: string, relativePath: string): Promise<string> {
+    return await safeInvoke<string>('read_vault_asset', { vaultPath, relativePath })
+  }
+
+  async function deleteVaultFile(vaultPath: string, relativePath: string): Promise<void> {
+    await safeInvoke('delete_vault_file', { vaultPath, relativePath })
+  }
+
+  async function pathExists(path: string): Promise<boolean> {
+    try {
+      return await safeInvoke<boolean>('path_exists', { path })
+    } catch {
+      return false
+    }
+  }
+
   return {
     getICloudPath,
     readMetadata,
@@ -252,5 +321,15 @@ export function useFileSystem() {
     renameDirectoryFolder,
     deleteDirectoryFolder,
     moveNoteFile,
+    // Boss Brain
+    getDefaultVaultPath,
+    ensureVaultStructure,
+    scanVaultFiles,
+    readVaultTextFile,
+    writeVaultTextFile,
+    saveVaultAsset,
+    readVaultAsset,
+    deleteVaultFile,
+    pathExists,
   }
 }
