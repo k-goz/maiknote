@@ -24,11 +24,11 @@ export function useFileSystem() {
   }
 
   /**
-   * Read metadata.json file
+   * Read metadata.json file (optionally from a custom legacy path)
    */
-  async function readMetadata(): Promise<NoteMetadata> {
+  async function readMetadata(customPath?: string): Promise<NoteMetadata> {
     try {
-      const path = await getICloudPath()
+      const path = customPath || await getICloudPath()
       const content = await safeInvoke<string>('read_metadata', { basePath: path })
       return JSON.parse(content)
     } catch (e) {
@@ -55,11 +55,11 @@ export function useFileSystem() {
   }
 
   /**
-   * Read a single note file (optionally from a directory folder)
+   * Read a single note file (optionally from a directory folder, optionally from custom path)
    */
-  async function readNote(id: string, dir?: string): Promise<string> {
+  async function readNote(id: string, dir?: string, customPath?: string): Promise<string> {
     try {
-      const path = await getICloudPath()
+      const path = customPath || await getICloudPath()
       const args: Record<string, unknown> = { basePath: path, id }
       if (dir) args.dir = dir
       return await safeInvoke<string>('read_note', args)

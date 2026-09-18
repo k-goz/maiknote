@@ -86,7 +86,7 @@ export class VaultIndexer {
           title: n.title,
           relativePath: n.relativePath,
           mtime: n.mtime || Date.now(),
-          size: n.content.length,
+          size: (n as any).size ?? n.content.length,
           createdAt: n.createdAt,
           updatedAt: n.updatedAt,
           tags: n.tags || [],
@@ -137,13 +137,13 @@ export class VaultIndexer {
       const cached = cachedMap[relPath]
 
       // Check if file is unmodified according to cache
-      if (cached && cached.mtime === file.modified_ms && !forceRebuild) {
+      if (cached && cached.mtime === file.modified_ms && (cached.size === undefined || cached.size === file.size) && !forceRebuild) {
         // Read content only
         try {
           const raw = await this.fs.readVaultTextFile(vaultPath, relPath)
           const { body, frontmatter } = extractFrontmatterAndBody(raw)
 
-          notes.push({
+          const noteObj: Note = {
             id: cached.id,
             title: cached.title,
             content: body,
@@ -161,7 +161,9 @@ export class VaultIndexer {
             wikilinks: cached.wikilinks,
             backlinks: cached.backlinks || [],
             mtime: file.modified_ms,
-          })
+          }
+          ;(noteObj as any).size = file.size
+          notes.push(noteObj)
           continue
         } catch (e) {
           console.warn(`Failed reading cached file ${relPath}, will re-parse:`, e)
@@ -206,7 +208,7 @@ export class VaultIndexer {
         const type = frontmatter.type || 'note'
         const project = frontmatter.project || ''
 
-        notes.push({
+        const noteObj: Note = {
           id: noteId,
           title,
           content: body,
@@ -224,7 +226,9 @@ export class VaultIndexer {
           wikilinks: links,
           backlinks: [],
           mtime: file.modified_ms,
-        })
+        }
+        ;(noteObj as any).size = file.size
+        notes.push(noteObj)
       } catch (err) {
         console.error(`Error parsing markdown file ${relPath}:`, err)
       }

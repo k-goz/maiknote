@@ -24,7 +24,7 @@ export function extractFrontmatterAndBody(content: string): {
   }
 
   const yamlText = match[1]
-  const body = trimmed.slice(match[0].length)
+  const body = trimmed.slice(match[0].length).replace(/^\r?\n/, '')
 
   try {
     const parsed = load(yamlText)

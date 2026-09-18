@@ -138,6 +138,21 @@ export const useNoteStore = defineStore('note', () => {
   const pendingSaveNotes = new Set<string>()
   let metadataSavePending = false
 
+  // Disk snapshot tracking for external change detection
+  const lastDiskSnapshot = new Map<string, { mtime: number; size: number }>()
+
+  function updateDiskSnapshot(items: Array<{ relativePath?: string; mtime?: number; size?: number; content?: string }>) {
+    lastDiskSnapshot.clear()
+    for (const item of items) {
+      if (item.relativePath) {
+        lastDiskSnapshot.set(item.relativePath, {
+          mtime: item.mtime || 0,
+          size: (item as any).size || (item.content ? item.content.length : 0),
+        })
+      }
+    }
+  }
+
   /**
    * Schedule a save (debounced)
    */
@@ -182,6 +197,8 @@ export const useNoteStore = defineStore('note', () => {
             await fs.writeVaultTextFile(vaultPath, note.relativePath, fullMarkdown)
             note.isDirty = false
             note.mtime = Date.now()
+            ;(note as any).size = fullMarkdown.length
+            lastDiskSnapshot.set(note.relativePath, { mtime: note.mtime, size: fullMarkdown.length })
           } else {
             await fs.writeNote(note.id, note.content, note.directoryId)
           }
@@ -231,6 +248,7 @@ export const useNoteStore = defineStore('note', () => {
 
           if (scanned.length > 0) {
             notes.value = scanned
+            updateDiskSnapshot(scanned)
 
             const lastOpenedId = localStorage.getItem('lastOpenedNoteId')
             const active = activeNoteList.value
@@ -339,7 +357,9 @@ export const useNoteStore = defineStore('note', () => {
         const fullMarkdown = stringifyWithFrontmatter(frontmatter, note.content)
         await fs.writeVaultTextFile(vaultPath, note.relativePath, fullMarkdown)
         note.mtime = Date.now()
+        ;(note as any).size = fullMarkdown.length
         note.isDirty = false
+        lastDiskSnapshot.set(note.relativePath, { mtime: note.mtime, size: fullMarkdown.length })
         await vaultIndexer.saveCache(vaultPath, notes.value)
       } else {
         await fs.writeNote(note.id, note.content, note.directoryId)
@@ -783,31 +803,83 @@ export const useNoteStore = defineStore('note', () => {
 
     try {
       const files = await fs.scanVaultFiles(vaultPath)
-      const current = currentNote.value
+      const diskFiles = files.filter(f => !f.relative_path.startsWith('.bossbrain/'))
 
-      let shouldRescan = false
-      const currentFile = current?.relativePath ? files.find(f => f.relative_path === current.relativePath) : null
+      const diskSnapshot = new Map<string, { mtime: number; size: number }>()
+      for (const f of diskFiles) {
+        diskSnapshot.set(f.relative_path, { mtime: f.modified_ms, size: f.size })
+      }
 
-      if (current && currentFile && current.mtime && currentFile.modified_ms > current.mtime + 500) {
-        const raw = await fs.readVaultTextFile(vaultPath, current.relativePath!)
-        const { frontmatter, body } = extractFrontmatterAndBody(raw)
+      // Check for any differences between disk and current memory state
+      let hasAnyDiff = false
 
-        if (current.isDirty) {
-          current.hasConflict = true
-          current.conflictContent = body
-        } else {
-          current.content = body
-          current.frontmatter = frontmatter as BossBrainFrontmatter
-          current.title = frontmatter.title || current.title
-          current.mtime = currentFile.modified_ms
+      // 1. File count differs
+      if (diskSnapshot.size !== notes.value.length) {
+        hasAnyDiff = true
+      }
+
+      // 2. Check for added or modified files on disk
+      for (const [relPath, diskEntry] of diskSnapshot) {
+        const memNote = notes.value.find(n => n.relativePath === relPath)
+        if (!memNote) {
+          hasAnyDiff = true
+          break
         }
-        shouldRescan = true
+        const lastEntry = lastDiskSnapshot.get(relPath)
+        if (lastEntry) {
+          if (diskEntry.mtime !== lastEntry.mtime || diskEntry.size !== lastEntry.size) {
+            hasAnyDiff = true
+            break
+          }
+        } else if (memNote.mtime && (diskEntry.mtime > memNote.mtime + 500 || ((memNote as any).size && diskEntry.size !== (memNote as any).size))) {
+          hasAnyDiff = true
+          break
+        }
       }
 
-      const nonSystemFiles = files.filter(f => !f.relative_path.startsWith('.bossbrain/'))
-      if (nonSystemFiles.length !== notes.value.length || shouldRescan) {
-        await rescanVault(false)
+      // 3. Check for deleted files from disk
+      if (!hasAnyDiff) {
+        for (const note of notes.value) {
+          if (note.relativePath && !diskSnapshot.has(note.relativePath)) {
+            hasAnyDiff = true
+            break
+          }
+        }
       }
+
+      // If no difference across the vault, return early
+      if (!hasAnyDiff) return
+
+      // Handle current open note if it changed on disk
+      const current = currentNote.value
+      if (current && current.relativePath) {
+        const curDisk = diskSnapshot.get(current.relativePath)
+        const curLast = lastDiskSnapshot.get(current.relativePath)
+        const isCurModified = curDisk && (
+          (curLast && (curDisk.mtime !== curLast.mtime || curDisk.size !== curLast.size)) ||
+          (current.mtime && curDisk.mtime > current.mtime + 500)
+        )
+
+        if (isCurModified) {
+          const raw = await fs.readVaultTextFile(vaultPath, current.relativePath)
+          const { frontmatter, body } = extractFrontmatterAndBody(raw)
+
+          if (current.isDirty) {
+            // Lock conflict state, preserve local unpersisted edits and store disk content
+            current.hasConflict = true
+            current.conflictContent = body
+          } else {
+            current.content = body
+            current.frontmatter = frontmatter as BossBrainFrontmatter
+            current.title = frontmatter.title || current.title
+            current.mtime = curDisk.mtime
+            ;(current as any).size = curDisk.size
+          }
+        }
+      }
+
+      // Safe refresh of vault
+      await rescanVault(false)
     } catch (e) {
       console.warn('Error checking external vault changes:', e)
     }
@@ -821,7 +893,7 @@ export const useNoteStore = defineStore('note', () => {
       note.hasConflict = false
       note.conflictContent = undefined
       note.isDirty = true
-      scheduleSave(note)
+      await saveNoteToStorage(note)
     } else if (choice === 'keep-disk') {
       if (note.conflictContent !== undefined) {
         note.content = note.conflictContent
@@ -829,8 +901,18 @@ export const useNoteStore = defineStore('note', () => {
       note.hasConflict = false
       note.conflictContent = undefined
       note.isDirty = false
+      if (settingStore.settings.vaultPath && note.relativePath) {
+        const files = await fs.scanVaultFiles(settingStore.settings.vaultPath)
+        const diskFile = files.find(f => f.relative_path === note.relativePath)
+        if (diskFile) {
+          note.mtime = diskFile.modified_ms
+          ;(note as any).size = diskFile.size
+          lastDiskSnapshot.set(note.relativePath, { mtime: diskFile.modified_ms, size: diskFile.size })
+        }
+      }
     } else if (choice === 'conflict-copy') {
       const conflictTitle = `${note.title} (Conflict Copy)`
+      const origId = note.id
       await createNoteWithContent(conflictTitle, note.content)
       if (note.conflictContent !== undefined) {
         note.content = note.conflictContent
@@ -838,6 +920,16 @@ export const useNoteStore = defineStore('note', () => {
       note.hasConflict = false
       note.conflictContent = undefined
       note.isDirty = false
+      currentNoteId.value = origId
+      if (settingStore.settings.vaultPath && note.relativePath) {
+        const files = await fs.scanVaultFiles(settingStore.settings.vaultPath)
+        const diskFile = files.find(f => f.relative_path === note.relativePath)
+        if (diskFile) {
+          note.mtime = diskFile.modified_ms
+          ;(note as any).size = diskFile.size
+          lastDiskSnapshot.set(note.relativePath, { mtime: diskFile.modified_ms, size: diskFile.size })
+        }
+      }
     }
   }
 
@@ -850,12 +942,45 @@ export const useNoteStore = defineStore('note', () => {
       const scanned = await vaultIndexer.scanVault(vaultPath, forceRebuild)
       if (scanned.length > 0) {
         const oldId = currentNoteId.value
-        notes.value = scanned
-        if (oldId && scanned.some(n => n.id === oldId)) {
+
+        // Preserve dirty / conflicting notes from being wiped by disk scan
+        const preservedMap = new Map<string, Note>()
+        for (const n of notes.value) {
+          if (n.isDirty || n.hasConflict) {
+            preservedMap.set(n.id, n)
+            if (n.relativePath) preservedMap.set(n.relativePath, n)
+          }
+        }
+
+        const mergedNotes = scanned.map(sn => {
+          const preserved = preservedMap.get(sn.id) || (sn.relativePath ? preservedMap.get(sn.relativePath) : undefined)
+          if (preserved) {
+            return {
+              ...sn,
+              content: preserved.content,
+              isDirty: preserved.isDirty,
+              hasConflict: preserved.hasConflict,
+              conflictContent: preserved.conflictContent,
+              frontmatter: preserved.frontmatter,
+              title: preserved.title,
+            }
+          }
+          return sn
+        })
+
+        notes.value = mergedNotes
+        updateDiskSnapshot(scanned)
+
+        if (oldId && mergedNotes.some(n => n.id === oldId)) {
           currentNoteId.value = oldId
         } else {
-          currentNoteId.value = scanned[0].id
+          currentNoteId.value = mergedNotes[0].id
         }
+      } else {
+        // Vault is completely empty (F1-03)
+        notes.value = []
+        lastDiskSnapshot.clear()
+        await createNoteAtHead()
       }
     } catch (e) {
       console.error('Failed to rescan vault:', e)

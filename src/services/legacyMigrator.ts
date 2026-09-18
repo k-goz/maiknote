@@ -40,7 +40,7 @@ export async function migrateLegacyMaikNote(
   // 2. Read legacy metadata.json safely
   let metadata: NoteMetadata
   try {
-    const rawMeta = await fs.readMetadata()
+    const rawMeta = await fs.readMetadata(sourceDir)
     metadata = rawMeta
   } catch (e: any) {
     report.errors.push({ id: 'metadata', error: `Failed to read legacy metadata: ${e.message}` })
@@ -60,7 +60,7 @@ export async function migrateLegacyMaikNote(
   for (const item of metadata.notes) {
     try {
       // Read content from legacy location
-      const content = await fs.readNote(item.id, item.directoryId)
+      const content = await fs.readNote(item.id, item.directoryId, sourceDir)
       const createdDate = new Date(item.createdAt || Date.now())
       const updatedDate = new Date(item.updatedAt || item.createdAt || Date.now())
 

@@ -977,12 +977,39 @@ async fn scan_vault_files(vault_path: String) -> Result<Vec<VaultFileInfo>, Stri
     Ok(results)
 }
 
+/// Validate and resolve a relative path inside vault_root safely.
+/// Rejects absolute paths, parent directory navigation (..), and prefix components.
+pub fn safe_vault_path(vault_root: &std::path::Path, relative_path: &str) -> Result<PathBuf, String> {
+    let trimmed = relative_path.trim();
+    if trimmed.is_empty() {
+        return Err("Relative path cannot be empty".to_string());
+    }
+    let rel = std::path::Path::new(trimmed);
+    if rel.is_absolute() {
+        return Err(format!("Path must be relative, got absolute: {}", relative_path));
+    }
+    for component in rel.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                return Err(format!("Parent directory traversal (..) is strictly forbidden: {}", relative_path));
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(format!("Root or prefix components are strictly forbidden: {}", relative_path));
+            }
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+        }
+    }
+    let target = vault_root.join(rel);
+    Ok(target)
+}
+
 /// Read text file at relative path in vault
 #[tauri::command]
 async fn read_vault_text_file(vault_path: String, relative_path: String) -> Result<String, String> {
-    let path = PathBuf::from(vault_path).join(relative_path);
+    let root = PathBuf::from(&vault_path);
+    let path = safe_vault_path(&root, &relative_path)?;
     if !path.exists() {
-        return Err("File does not exist".to_string());
+        return Err(format!("File does not exist: {}", relative_path));
     }
     fs::read_to_string(path).map_err(|e| e.to_string())
 }
@@ -990,7 +1017,8 @@ async fn read_vault_text_file(vault_path: String, relative_path: String) -> Resu
 /// Write text file at relative path in vault
 #[tauri::command]
 async fn write_vault_text_file(vault_path: String, relative_path: String, content: String) -> Result<(), String> {
-    let path = PathBuf::from(vault_path).join(relative_path);
+    let root = PathBuf::from(&vault_path);
+    let path = safe_vault_path(&root, &relative_path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -1000,7 +1028,8 @@ async fn write_vault_text_file(vault_path: String, relative_path: String, conten
 /// Delete file at relative path in vault
 #[tauri::command]
 async fn delete_vault_file(vault_path: String, relative_path: String) -> Result<(), String> {
-    let path = PathBuf::from(vault_path).join(relative_path);
+    let root = PathBuf::from(&vault_path);
+    let path = safe_vault_path(&root, &relative_path)?;
     if path.exists() {
         fs::remove_file(path).map_err(|e| e.to_string())?;
     }
@@ -1608,3 +1637,43 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_safe_vault_path_valid() {
+        let root = Path::new("/Users/test/BossBrain");
+        let result = safe_vault_path(root, "00-Inbox/note.md").unwrap();
+        assert_eq!(result, PathBuf::from("/Users/test/BossBrain/00-Inbox/note.md"));
+
+        let result2 = safe_vault_path(root, "01-Projects/HealthTwin/README.md").unwrap();
+        assert_eq!(result2, PathBuf::from("/Users/test/BossBrain/01-Projects/HealthTwin/README.md"));
+    }
+
+    #[test]
+    fn test_safe_vault_path_rejects_parent_dir() {
+        let root = Path::new("/Users/test/BossBrain");
+        assert!(safe_vault_path(root, "../escape.md").is_err());
+        assert!(safe_vault_path(root, "../../escape.md").is_err());
+        assert!(safe_vault_path(root, "00-Inbox/../../etc/passwd").is_err());
+        assert!(safe_vault_path(root, "foo/bar/../../../secret").is_err());
+    }
+
+    #[test]
+    fn test_safe_vault_path_rejects_absolute_path() {
+        let root = Path::new("/Users/test/BossBrain");
+        assert!(safe_vault_path(root, "/absolute/path.md").is_err());
+        assert!(safe_vault_path(root, "/Users/test/secret.txt").is_err());
+    }
+
+    #[test]
+    fn test_safe_vault_path_rejects_empty() {
+        let root = Path::new("/Users/test/BossBrain");
+        assert!(safe_vault_path(root, "").is_err());
+        assert!(safe_vault_path(root, "   ").is_err());
+    }
+}
+

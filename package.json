@@ -13,6 +13,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "sync-version": "node scripts/sync-version.js",
+    "test": "node --test tests/unit.test.mjs tests/integration.test.mjs tests/bossbrain.test.mjs",
     "pretauri": "npm run sync-version",
     "postinstall": "patch-package"
   },

@@ -34,8 +34,7 @@
       "assetProtocol": {
         "enable": true,
         "scope": [
-          "$HOME/Library/Mobile Documents/com~apple~CloudDocs/**",
-          "$HOME/**"
+          "$HOME/Library/Mobile Documents/com~apple~CloudDocs/**"
         ]
       }
     },
