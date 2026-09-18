@@ -1,13 +1,30 @@
 import { defineStore } from 'pinia'
 import { ref, computed, watch } from 'vue'
-import type { Note, NoteMetadata } from '@/types/note'
+import type { Note, NoteMetadata, BossBrainFrontmatter } from '@/types/note'
 import { useFileSystem } from '@/composables/useFileSystem'
 import { useDirectoryStore } from '@/stores/directoryStore'
+import { useSettingStore } from '@/stores/settingStore'
+import { vaultIndexer } from '@/services/vaultIndexer'
+import { initializeBossBrainVault } from '@/services/vaultManager'
+import {
+  generateBossBrainFilename,
+  generateNoteId,
+  formatISO8601WithOffset,
+} from '@/utils/slug'
+import {
+  extractFrontmatterAndBody,
+  stringifyWithFrontmatter,
+  buildCanonicalFrontmatter,
+} from '@/utils/frontmatter'
+import { resolveWikilinkTarget } from '@/utils/wikilink'
+import { diffVaultSnapshot, mergeScannedWithPreservedNotes } from '@/services/vaultChangeDetector'
+import { resolveNoteConflict } from '@/services/conflictResolver'
 import i18n from '@/i18n'
 
 export const useNoteStore = defineStore('note', () => {
   // File system
   const fs = useFileSystem()
+  const settingStore = useSettingStore()
 
   // State
   const notes = ref<Note[]>([])
@@ -46,9 +63,16 @@ export const useNoteStore = defineStore('note', () => {
   /** 按 filterDirectoryId 过滤后的笔记列表 */
   const activeNoteList = computed(() => {
     if (filterDirectoryId.value === null) {
+      if (settingStore.settings.enableBossBrain) {
+        return activeNotes.value
+      }
       return activeNotes.value.filter(n => !n.directoryId)
     }
-    return activeNotes.value.filter(n => n.directoryId === filterDirectoryId.value)
+    const targetDir = filterDirectoryId.value
+    return activeNotes.value.filter(n =>
+      n.directoryId === targetDir ||
+      (n.relativePath && n.relativePath.startsWith(`${targetDir}/`))
+    )
   })
 
   /** 当前笔记在 activeNoteList 中的索引 */
@@ -59,10 +83,16 @@ export const useNoteStore = defineStore('note', () => {
   const filteredNotes = computed(() => {
     if (!searchQuery.value) return activeNotes.value
     const query = searchQuery.value.toLowerCase()
-    return activeNotes.value.filter(n =>
-      n.title.toLowerCase().includes(query) ||
-      n.content.toLowerCase().includes(query)
-    )
+    return activeNotes.value.filter(n => {
+      const titleMatch = (n.title || '').toLowerCase().includes(query)
+      const contentMatch = (n.content || '').toLowerCase().includes(query)
+      const tagMatch = (n.tags || []).some(t => t.toLowerCase().includes(query))
+      const projectMatch = (n.project || '').toLowerCase().includes(query)
+      const pathMatch = (n.relativePath || '').toLowerCase().includes(query)
+      const aliasMatch = Array.isArray(n.frontmatter?.aliases) &&
+        n.frontmatter.aliases.some((a: any) => String(a).toLowerCase().includes(query))
+      return titleMatch || contentMatch || tagMatch || projectMatch || pathMatch || aliasMatch
+    })
   })
 
   const pinnedNotes = computed(() =>
@@ -80,7 +110,7 @@ export const useNoteStore = defineStore('note', () => {
   }
 
   // Helper: Show navigation hint
-  let hintTimeout: number | null = null
+  let hintTimeout: ReturnType<typeof setTimeout> | null = null
   function showHint(message: string) {
     if (hintTimeout) {
       clearTimeout(hintTimeout)
@@ -103,19 +133,35 @@ export const useNoteStore = defineStore('note', () => {
   }
 
   // ============================================
-  // iCloud Persistence Functions
+  // Persistence Functions
   // ============================================
 
   // Debounced save state
-  let saveTimeout: number | null = null
+  let saveTimeout: ReturnType<typeof setTimeout> | null = null
   const pendingSaveNotes = new Set<string>()
   let metadataSavePending = false
 
+  // Disk snapshot tracking for external change detection
+  const lastDiskSnapshot = new Map<string, { mtime: number; size: number }>()
+
+  function updateDiskSnapshot(items: Array<{ relativePath?: string; mtime?: number; size?: number; content?: string }>) {
+    lastDiskSnapshot.clear()
+    for (const item of items) {
+      if (item.relativePath) {
+        lastDiskSnapshot.set(item.relativePath, {
+          mtime: item.mtime || 0,
+          size: (item as any).size || (item.content ? item.content.length : 0),
+        })
+      }
+    }
+  }
+
   /**
-   * Schedule a save to iCloud (debounced)
+   * Schedule a save (debounced)
    */
   function scheduleSave(note?: Note) {
     if (note) {
+      note.isDirty = true
       pendingSaveNotes.add(note.id)
     } else {
       metadataSavePending = true
@@ -126,36 +172,38 @@ export const useNoteStore = defineStore('note', () => {
     }
 
     saveTimeout = setTimeout(async () => {
-      // Save all pending notes
       const notesToSave = Array.from(pendingSaveNotes)
         .map(id => notes.value.find(n => n.id === id))
         .filter((n): n is Note => n !== undefined)
 
       for (const note of notesToSave) {
         try {
-          await fs.writeNote(note.id, note.content, note.directoryId)
+          await saveNoteToStorage(note)
         } catch (e) {
-          console.error('Failed to save note to iCloud:', e)
+          console.error('Failed to save note:', e)
         }
       }
 
-      // Save metadata if any note changed or metadata explicitly requested
-      if (notesToSave.length > 0 || metadataSavePending) {
-        try {
-          await saveMetadataToCloud()
-        } catch (e) {
-          console.error('Failed to save metadata to iCloud:', e)
+      if (settingStore.settings.enableBossBrain && settingStore.settings.vaultPath) {
+        await vaultIndexer.saveCache(settingStore.settings.vaultPath, notes.value)
+      } else {
+        if (notesToSave.length > 0 || metadataSavePending) {
+          try {
+            await saveMetadataToCloud()
+          } catch (e) {
+            console.error('Failed to save metadata to iCloud:', e)
+          }
         }
       }
 
       pendingSaveNotes.clear()
       metadataSavePending = false
       saveTimeout = null
-    }, 500) as unknown as number
+    }, 500)
   }
 
   /**
-   * Load all notes from iCloud
+   * Load all notes
    */
   async function loadNotes(): Promise<void> {
     if (isLoading.value) return
@@ -164,15 +212,45 @@ export const useNoteStore = defineStore('note', () => {
     loadError.value = null
 
     try {
-      const metadata = await fs.readMetadata()
+      if (settingStore.settings.enableBossBrain) {
+        if (!settingStore.settings.vaultPath) {
+          const defaultPath = await fs.getDefaultVaultPath()
+          settingStore.updateSettings('vaultPath', defaultPath)
+        }
 
-      // Convert metadata items to full notes with empty content
+        const vaultPath = settingStore.settings.vaultPath
+        if (vaultPath) {
+          await initializeBossBrainVault(vaultPath)
+          const scanned = await vaultIndexer.scanVault(vaultPath)
+
+          if (scanned.length > 0) {
+            notes.value = scanned
+            updateDiskSnapshot(scanned)
+
+            const lastOpenedId = localStorage.getItem('lastOpenedNoteId')
+            const active = activeNoteList.value
+            if (lastOpenedId && active.some(n => n.id === lastOpenedId)) {
+              currentNoteId.value = lastOpenedId
+            } else if (active.length > 0) {
+              currentNoteId.value = active[0].id
+            } else {
+              currentNoteId.value = scanned[0].id
+            }
+            return
+          } else {
+            // Vault is completely empty, create first note in 00-Inbox/
+            await createNoteAtHead()
+            return
+          }
+        }
+      }
+
+      // Legacy MaikNote loader fallback
+      const metadata = await fs.readMetadata()
       const loadedNotes: Note[] = []
 
       for (const item of metadata.notes) {
-        // Read content from file (from directory if applicable)
         const content = await fs.readNote(item.id, item.directoryId)
-
         loadedNotes.push({
           id: item.id,
           title: item.title,
@@ -190,7 +268,6 @@ export const useNoteStore = defineStore('note', () => {
 
       notes.value = loadedNotes
 
-      // 恢复上次打开的笔记（确保在过滤后的列表中）
       const lastOpenedId = localStorage.getItem('lastOpenedNoteId')
       const active = activeNoteList.value
       if (lastOpenedId && active.some(n => n.id === lastOpenedId)) {
@@ -202,8 +279,7 @@ export const useNoteStore = defineStore('note', () => {
       }
     } catch (e) {
       loadError.value = e as Error
-      console.error('Failed to load notes from iCloud:', e)
-      // Create initial note on error
+      console.error('Failed to load notes:', e)
       createNoteAtHead()
     } finally {
       isLoading.value = false
@@ -211,7 +287,7 @@ export const useNoteStore = defineStore('note', () => {
   }
 
   /**
-   * Save metadata to iCloud (internal function)
+   * Save metadata to iCloud (legacy)
    */
   async function saveMetadataToCloud(): Promise<void> {
     const metadata: NoteMetadata = {
@@ -229,37 +305,91 @@ export const useNoteStore = defineStore('note', () => {
         trashedAt: note.trashedAt,
       })),
     }
-
     await fs.writeMetadata(metadata)
   }
 
   /**
-   * Save a single note to iCloud immediately (for new notes)
+   * Save a single note immediately
    */
-  async function saveNoteToCloud(note: Note): Promise<void> {
+  async function saveNoteToStorage(note: Note): Promise<void> {
     try {
-      // Save content to file (in directory if assigned)
-      await fs.writeNote(note.id, note.content, note.directoryId)
-
-      // Update metadata
-      await saveMetadataToCloud()
+      if (settingStore.settings.enableBossBrain && settingStore.settings.vaultPath && note.relativePath) {
+        const vaultPath = settingStore.settings.vaultPath
+        const frontmatter = buildCanonicalFrontmatter(note, note.frontmatter)
+        note.frontmatter = frontmatter
+        const fullMarkdown = stringifyWithFrontmatter(frontmatter, note.content)
+        const writeRes = await fs.writeVaultTextFile(vaultPath, note.relativePath, fullMarkdown)
+        note.mtime = writeRes.modified_ms
+        ;(note as any).size = writeRes.size
+        note.isDirty = false
+        lastDiskSnapshot.set(note.relativePath, { mtime: writeRes.modified_ms, size: writeRes.size })
+        await vaultIndexer.saveCache(vaultPath, notes.value)
+      } else {
+        await fs.writeNote(note.id, note.content, note.directoryId)
+        await saveMetadataToCloud()
+      }
     } catch (e) {
-      console.error('Failed to save note to iCloud:', e)
+      console.error('Failed to save note to storage:', e)
       throw e
     }
   }
 
   /**
-   * Delete note from iCloud
+   * Helper to construct a new Note object
    */
-  async function deleteNoteFromCloud(id: string): Promise<void> {
-    try {
-      const note = notes.value.find(n => n.id === id)
-      await fs.deleteNote(id, note?.directoryId)
-      await saveMetadataToCloud()
-    } catch (e) {
-      console.error('Failed to delete note from iCloud:', e)
-      throw e
+  function buildNewNote(initialTitle = 'New Note', initialContent = ''): Note {
+    const now = Date.now()
+    const isBossBrain = settingStore.settings.enableBossBrain
+
+    if (isBossBrain) {
+      const filename = generateBossBrainFilename(initialTitle || 'New Note', new Date(now))
+      const targetFolder = currentDirectoryId() || '00-Inbox'
+      const relativePath = `${targetFolder}/${filename}`
+      const id = generateNoteId(initialTitle || 'New Note', new Date(now))
+
+      const frontmatter: BossBrainFrontmatter = {
+        id,
+        title: initialTitle,
+        created: formatISO8601WithOffset(new Date(now)),
+        updated: formatISO8601WithOffset(new Date(now)),
+        type: 'note',
+        status: 'inbox',
+        project: '',
+        tags: [],
+        source: 'maiknote',
+      }
+
+      return {
+        id,
+        title: initialTitle,
+        content: initialContent,
+        createdAt: now,
+        updatedAt: now,
+        isPinned: false,
+        isLocked: false,
+        directoryId: targetFolder,
+        relativePath,
+        status: 'inbox',
+        type: 'note',
+        project: '',
+        source: 'maiknote',
+        frontmatter,
+        wikilinks: [],
+        backlinks: [],
+        mtime: now,
+        isDirty: false,
+      }
+    }
+
+    return {
+      id: crypto.randomUUID(),
+      title: initialTitle,
+      content: initialContent,
+      createdAt: now,
+      updatedAt: now,
+      isPinned: false,
+      isLocked: false,
+      directoryId: currentDirectoryId(),
     }
   }
 
@@ -272,7 +402,6 @@ export const useNoteStore = defineStore('note', () => {
   }
 
   function selectNote(id: string) {
-    // 侧边栏点击：按列表索引推断方向
     const active = activeNoteList.value
     const oldIdx = active.findIndex(n => n.id === currentNoteId.value)
     const newIdx = active.findIndex(n => n.id === id)
@@ -282,153 +411,123 @@ export const useNoteStore = defineStore('note', () => {
     currentNoteId.value = id
   }
 
-  /**
-   * 设置目录过滤，切换后自动选中该目录下第一篇笔记
-   */
   function setFilterDirectory(id: string | null) {
     filterDirectoryId.value = id
-    // 同步更新目录选中状态，触发 localStorage 持久化
     const directoryStore = useDirectoryStore()
     directoryStore.selectDirectory(id)
-    // 确保当前笔记在过滤后的列表中
     const active = activeNoteList.value
     const hasCurrent = active.some(n => n.id === currentNoteId.value)
     if (!hasCurrent) {
       if (active.length > 0) {
         currentNoteId.value = active[0].id
       } else {
-        // 目录为空时创建一篇新笔记
         createNoteAtHead()
       }
     }
   }
 
-  /** 当前目录过滤下的 directoryId，新建笔记时使用 */
   function currentDirectoryId(): string | undefined {
     return filterDirectoryId.value ?? undefined
   }
 
   async function createNoteAtHead(): Promise<Note> {
-    const now = Date.now()
-    const newNote: Note = {
-      id: crypto.randomUUID(),
-      title: 'New Note',
-      content: '',
-      createdAt: now,
-      updatedAt: now,
-      isPinned: false,
-      isLocked: false,
-      directoryId: currentDirectoryId(),
-    }
+    const newNote = buildNewNote('New Note', '')
     notes.value.unshift(newNote)
     currentNoteId.value = newNote.id
-
-    // Save to iCloud
-    await saveNoteToCloud(newNote)
-
+    await saveNoteToStorage(newNote)
     return newNote
   }
 
   async function createNoteAtTail(): Promise<Note> {
-    const now = Date.now()
-    const newNote: Note = {
-      id: crypto.randomUUID(),
-      title: 'New Note',
-      content: '',
-      createdAt: now,
-      updatedAt: now,
-      isPinned: false,
-      isLocked: false,
-      directoryId: currentDirectoryId(),
-    }
+    const newNote = buildNewNote('New Note', '')
     notes.value.push(newNote)
     navDirection.value = 'right'
     currentNoteId.value = newNote.id
-
-    // Save to iCloud
-    await saveNoteToCloud(newNote)
-
+    await saveNoteToStorage(newNote)
     return newNote
   }
 
   async function createNoteAfterCurrent(): Promise<Note> {
-    const now = Date.now()
-    const newNote: Note = {
-      id: crypto.randomUUID(),
-      title: 'New Note',
-      content: '',
-      createdAt: now,
-      updatedAt: now,
-      isPinned: false,
-      isLocked: false,
-      directoryId: currentDirectoryId(),
-    }
-
-    // Find current note index directly to ensure accuracy
+    const newNote = buildNewNote('New Note', '')
     const index = notes.value.findIndex(n => n.id === currentNoteId.value)
-
     if (index !== -1) {
-      // Insert after current note
       notes.value.splice(index + 1, 0, newNote)
     } else {
-      // No current note, add to end
       notes.value.push(newNote)
     }
     navDirection.value = 'right'
     currentNoteId.value = newNote.id
-
-    // Save to iCloud
-    await saveNoteToCloud(newNote)
-
+    await saveNoteToStorage(newNote)
     return newNote
   }
 
   async function createNoteBeforeCurrent(): Promise<Note> {
-    const now = Date.now()
-    const newNote: Note = {
-      id: crypto.randomUUID(),
-      title: 'New Note',
-      content: '',
-      createdAt: now,
-      updatedAt: now,
-      isPinned: false,
-      isLocked: false,
-      directoryId: currentDirectoryId(),
-    }
-
-    // Find current note index directly to ensure accuracy
+    const newNote = buildNewNote('New Note', '')
     const index = notes.value.findIndex(n => n.id === currentNoteId.value)
-
     if (index !== -1) {
-      // Insert before current note
       notes.value.splice(index, 0, newNote)
     } else {
-      // No current note, add to end
       notes.value.push(newNote)
     }
     navDirection.value = 'left'
     currentNoteId.value = newNote.id
-
-    // Save to iCloud
-    await saveNoteToCloud(newNote)
-
+    await saveNoteToStorage(newNote)
     return newNote
   }
 
   async function createNoteWithContent(title: string, content: string): Promise<Note> {
+    const newNote = buildNewNote(title, content)
+    const currentIndex = notes.value.findIndex(n => n.id === currentNoteId.value)
+    if (currentIndex !== -1) {
+      notes.value.splice(currentIndex + 1, 0, newNote)
+    } else {
+      notes.value.push(newNote)
+    }
+    navDirection.value = 'right'
+    currentNoteId.value = newNote.id
+    await saveNoteToStorage(newNote)
+    return newNote
+  }
+
+  async function createRecoveredNote(title: string, content: string, sourceNote?: Note): Promise<Note> {
     const now = Date.now()
-    const newNote: Note = {
-      id: crypto.randomUUID(),
-      title: title,
-      content: content,
-      createdAt: now,
-      updatedAt: now,
-      isPinned: false,
-      isLocked: false,
-      directoryId: currentDirectoryId(),
+    const filename = generateBossBrainFilename(title, new Date(now))
+    // F3-02: Recovery V1 defaults strictly to 00-Inbox/ regardless of active directory
+    const relativePath = `00-Inbox/${filename}`
+    const id = generateNoteId(title, new Date(now))
+
+    const frontmatter: BossBrainFrontmatter = {
+      id,
+      title,
+      created: formatISO8601WithOffset(new Date(now)),
+      updated: formatISO8601WithOffset(new Date(now)),
+      type: 'note',
+      status: 'inbox',
+      project: sourceNote?.project || sourceNote?.frontmatter?.project || '',
+      tags: [...(sourceNote?.tags || sourceNote?.frontmatter?.tags || [])],
+      source: 'conflict-recovery',
     }
 
-    // Insert after current note
+    const newNote: Note = {
+      id,
+      title,
+      content,
+      createdAt: now,
+      updatedAt: now,
+      tags: frontmatter.tags,
+      isPinned: false,
+      isLocked: false,
+      relativePath,
+      isDirty: false,
+      frontmatter,
+      project: frontmatter.project,
+      type: 'note',
+      status: 'inbox',
+      source: 'conflict-recovery',
+      diskState: 'normal',
+      hasConflict: false,
+    }
+
     const currentIndex = notes.value.findIndex(n => n.id === currentNoteId.value)
     if (currentIndex !== -1) {
       notes.value.splice(currentIndex + 1, 0, newNote)
@@ -438,9 +537,7 @@ export const useNoteStore = defineStore('note', () => {
     navDirection.value = 'right'
     currentNoteId.value = newNote.id
 
-    // Save to iCloud
-    await saveNoteToCloud(newNote)
-
+    await saveNoteToStorage(newNote)
     return newNote
   }
 
@@ -448,14 +545,11 @@ export const useNoteStore = defineStore('note', () => {
     const index = notes.value.findIndex(n => n.id === id)
     if (index !== -1) {
       const note = notes.value[index]
-      // 原地更新字段而非替换数组元素，避免每次内容变化都触发所有依赖 notes 的计算属性重算
+      note.isDirty = true
       Object.assign(note, updates, { updatedAt: Date.now() })
-      // Update title if content changed
       if (updates.content) {
         note.title = extractTitle(updates.content)
       }
-
-      // Schedule save to iCloud (debounced)
       scheduleSave(note)
     }
   }
@@ -467,7 +561,7 @@ export const useNoteStore = defineStore('note', () => {
   async function deleteNote(id: string) {
     const note = notes.value.find(n => n.id === id)
     if (note?.isLocked || note?.trashedAt) {
-      return // Cannot delete locked note
+      return
     }
     if (note) {
       const oldActive = activeNoteList.value
@@ -475,14 +569,32 @@ export const useNoteStore = defineStore('note', () => {
       note.trashedAt = Date.now()
       note.updatedAt = Date.now()
       note.isPinned = false
+      note.status = 'archived'
       deletingNoteId.value = null
-      await saveMetadataToCloud()
 
-      // If deleted note was current, select the previous note (or first if at index 0)
+      if (settingStore.settings.enableBossBrain && settingStore.settings.vaultPath && note.relativePath) {
+        const vaultPath = settingStore.settings.vaultPath
+        const oldRel = note.relativePath
+        const filename = oldRel.split('/').pop() || `${note.id}.md`
+        const newRel = `90-Archive/${filename}`
+        note.relativePath = newRel
+        note.directoryId = '90-Archive'
+
+        try {
+          const content = await fs.readVaultTextFile(vaultPath, oldRel)
+          await fs.writeVaultTextFile(vaultPath, newRel, content)
+          await fs.deleteVaultFile(vaultPath, oldRel)
+        } catch (e) {
+          console.warn('Failed moving file to 90-Archive:', e)
+        }
+        await vaultIndexer.saveCache(vaultPath, notes.value)
+      } else {
+        await saveMetadataToCloud()
+      }
+
       if (currentNoteId.value === id) {
         const active = activeNoteList.value
         const newIndex = Math.min(Math.max(0, oldActiveIndex - 1), active.length - 1)
-        // 被删除笔记已从 activeNoteList 移除，watch 反查 oldIndex 会得到 -1，需显式指定方向
         navDirection.value = oldActiveIndex > 0 ? 'left' : 'right'
         currentNoteId.value = active[newIndex]?.id ?? null
       }
@@ -493,21 +605,45 @@ export const useNoteStore = defineStore('note', () => {
     const note = notes.value.find(n => n.id === id)
     if (!note?.trashedAt) return
 
-    const directoryStore = useDirectoryStore()
-    if (note.directoryId && !directoryStore.getDirectory(note.directoryId)) {
-      note.directoryId = undefined
-    }
     note.trashedAt = undefined
     note.updatedAt = Date.now()
-    await saveMetadataToCloud()
+    note.status = 'inbox'
+
+    if (settingStore.settings.enableBossBrain && settingStore.settings.vaultPath && note.relativePath) {
+      const vaultPath = settingStore.settings.vaultPath
+      const oldRel = note.relativePath
+      const filename = oldRel.split('/').pop() || `${note.id}.md`
+      const newRel = `00-Inbox/${filename}`
+      note.relativePath = newRel
+      note.directoryId = '00-Inbox'
+
+      try {
+        const content = await fs.readVaultTextFile(vaultPath, oldRel)
+        await fs.writeVaultTextFile(vaultPath, newRel, content)
+        await fs.deleteVaultFile(vaultPath, oldRel)
+      } catch (e) {
+        console.warn('Failed restoring file from 90-Archive:', e)
+      }
+      await vaultIndexer.saveCache(vaultPath, notes.value)
+    } else {
+      await saveMetadataToCloud()
+    }
   }
 
   async function permanentlyDeleteNote(id: string): Promise<void> {
     const index = notes.value.findIndex(n => n.id === id)
     if (index === -1) return
 
-    notes.value.splice(index, 1)
-    await deleteNoteFromCloud(id)
+    const [note] = notes.value.splice(index, 1)
+
+    if (settingStore.settings.enableBossBrain && settingStore.settings.vaultPath && note.relativePath) {
+      const vaultPath = settingStore.settings.vaultPath
+      await fs.deleteVaultFile(vaultPath, note.relativePath)
+      await vaultIndexer.saveCache(vaultPath, notes.value)
+    } else {
+      await fs.deleteNote(id, note.directoryId)
+      await saveMetadataToCloud()
+    }
 
     if (currentNoteId.value === id) {
       currentNoteId.value = activeNoteList.value[0]?.id ?? null
@@ -526,9 +662,7 @@ export const useNoteStore = defineStore('note', () => {
     if (note) {
       note.isPinned = !note.isPinned
       note.updatedAt = Date.now()
-
-      // Schedule metadata save to iCloud (debounced)
-      scheduleSave() // Will save metadata
+      scheduleSave(note)
     }
   }
 
@@ -537,16 +671,12 @@ export const useNoteStore = defineStore('note', () => {
     if (note) {
       note.isLocked = !note.isLocked
       note.updatedAt = Date.now()
-
-      // Set file permission based on lock state
       if (note.isLocked) {
         await fs.setNoteReadonly(id)
       } else {
         await fs.setNoteReadwrite(id)
       }
-
-      // Schedule metadata save to iCloud (debounced)
-      scheduleSave() // Will save metadata
+      scheduleSave(note)
     }
   }
 
@@ -568,72 +698,51 @@ export const useNoteStore = defineStore('note', () => {
     }
   }
 
-  // Navigate to previous note
   async function navigatePrevOrCreate() {
     const active = activeNoteList.value
     const activeIdx = active.findIndex(n => n.id === currentNoteId.value)
     const isEmpty = currentNote.value && isNoteEmpty(currentNote.value)
 
-    // At first position - show hint, don't navigate
     if (activeIdx === 0) {
       shakeWindow()
       showHint(i18n.global.t('nav.firstNote'))
       return
     }
 
-    // Current note is empty - delete it and navigate to previous
     if (isEmpty) {
       const idToDelete = currentNoteId.value!
-      const realIndex = notes.value.findIndex(n => n.id === idToDelete)
-      notes.value.splice(realIndex, 1)
-      // 空笔记已从列表移除，watch 无法反查其索引，显式指定向上一条切换的方向
+      await permanentlyDeleteNote(idToDelete)
       navDirection.value = 'left'
-      currentNoteId.value = active[activeIdx - 1].id
-
-      // Delete from iCloud
-      await deleteNoteFromCloud(idToDelete)
+      currentNoteId.value = active[activeIdx - 1]?.id || null
     } else {
-      // Navigate to previous note
       navDirection.value = 'left'
-      currentNoteId.value = active[activeIdx - 1].id
+      currentNoteId.value = active[activeIdx - 1]?.id || null
     }
   }
 
-  // Navigate to next note
   async function navigateNextOrCreate() {
     const active = activeNoteList.value
     const activeIdx = active.findIndex(n => n.id === currentNoteId.value)
     const isEmpty = currentNote.value && isNoteEmpty(currentNote.value)
 
-    // At last position
     if (activeIdx >= active.length - 1) {
       if (isEmpty) {
-        // Last note is empty - show hint
         shakeWindow()
         showHint(i18n.global.t('nav.lastNote'))
       } else {
-        // Last note has content - create new note at tail
         await createNoteAtTail()
       }
       return
     }
 
-    // Not at last position
     if (isEmpty) {
-      // Current note is empty - delete it and navigate to next
       const idToDelete = currentNoteId.value!
-      const realIndex = notes.value.findIndex(n => n.id === idToDelete)
-      notes.value.splice(realIndex, 1)
-      // 空笔记已从列表移除，watch 无法反查其索引，显式指定向下一条切换的方向
+      await permanentlyDeleteNote(idToDelete)
       navDirection.value = 'right'
-      currentNoteId.value = active[activeIdx + 1].id
-
-      // Delete from iCloud
-      await deleteNoteFromCloud(idToDelete)
+      currentNoteId.value = active[activeIdx + 1]?.id || null
     } else {
-      // Navigate to next note
       navDirection.value = 'right'
-      currentNoteId.value = active[activeIdx + 1].id
+      currentNoteId.value = active[activeIdx + 1]?.id || null
     }
   }
 
@@ -643,66 +752,199 @@ export const useNoteStore = defineStore('note', () => {
       const [note] = notes.value.splice(index, 1)
       notes.value.unshift(note)
       note.updatedAt = Date.now()
-
-      // Schedule metadata save to iCloud (debounced)
-      scheduleSave() // Will save metadata
+      scheduleSave(note)
     }
   }
 
-  /**
-   * Reorder notes by a list of note IDs
-   */
   function reorderNotes(noteIds: string[]) {
     const noteMap = new Map(notes.value.map(n => [n.id, n]))
     const reordered = noteIds.map(id => noteMap.get(id)).filter((n): n is Note => n !== undefined)
-
-    // Add any notes not in the reordered list at the end
     const reorderedIds = new Set(noteIds)
     const remaining = notes.value.filter(n => !reorderedIds.has(n.id))
-
     notes.value = [...reordered, ...remaining]
-
-    // Schedule metadata save to iCloud (debounced)
     scheduleSave()
   }
 
-  /**
-   * Get notes filtered by directory
-   */
   function getNotesByDirectory(directoryId: string | null): Note[] {
     if (directoryId === null) {
-      return activeNotes.value.filter(n => !n.directoryId)
+      return activeNotes.value
     }
-    return activeNotes.value.filter(n => n.directoryId === directoryId)
+    return activeNotes.value.filter(n =>
+      n.directoryId === directoryId ||
+      (n.relativePath && n.relativePath.startsWith(`${directoryId}/`))
+    )
   }
 
-  /**
-   * Move a note to a directory (also moves the file on filesystem)
-   */
   async function moveNoteToDirectory(noteId: string, directoryId: string | null): Promise<void> {
     const note = notes.value.find(n => n.id === noteId)
-    if (note) {
-      if (note.trashedAt) return
-      const fromDir = note.directoryId ?? null
-      const toDir = directoryId
-      note.directoryId = directoryId || undefined
-      note.updatedAt = Date.now()
-      // Move the actual file on the filesystem
-      await fs.moveNoteFile(noteId, fromDir, toDir)
-      scheduleSave()
+    if (note && !note.trashedAt) {
+      if (settingStore.settings.enableBossBrain && settingStore.settings.vaultPath && note.relativePath) {
+        const vaultPath = settingStore.settings.vaultPath
+        const oldRel = note.relativePath
+        const filename = oldRel.split('/').pop() || `${note.id}.md`
+        const targetDir = directoryId || '00-Inbox'
+        const newRel = `${targetDir}/${filename}`
+
+        note.relativePath = newRel
+        note.directoryId = directoryId || undefined
+        note.updatedAt = Date.now()
+
+        try {
+          const content = await fs.readVaultTextFile(vaultPath, oldRel)
+          await fs.writeVaultTextFile(vaultPath, newRel, content)
+          await fs.deleteVaultFile(vaultPath, oldRel)
+        } catch (e) {
+          console.error('Failed moving note file in vault:', e)
+        }
+        await vaultIndexer.saveCache(vaultPath, notes.value)
+      } else {
+        const fromDir = note.directoryId ?? null
+        const toDir = directoryId
+        note.directoryId = directoryId || undefined
+        note.updatedAt = Date.now()
+        await fs.moveNoteFile(noteId, fromDir, toDir)
+        scheduleSave()
+      }
     }
   }
 
-  /**
-   * Initialize the store by loading notes from iCloud
-   */
+  // ============================================
+  // External Modification & Conflict Handling
+  // ============================================
+
+  async function checkExternalChanges(): Promise<void> {
+    if (!settingStore.settings.enableBossBrain || !settingStore.settings.vaultPath) return
+    const vaultPath = settingStore.settings.vaultPath
+
+    try {
+      const files = await fs.scanVaultFiles(vaultPath)
+      const diskFiles = files.filter(f => !f.relative_path.startsWith('.bossbrain/'))
+
+      const diskSnapshot = new Map<string, { mtime: number; size: number }>()
+      for (const f of diskFiles) {
+        diskSnapshot.set(f.relative_path, { mtime: f.modified_ms, size: f.size })
+      }
+
+      const diff = diffVaultSnapshot(diskSnapshot, lastDiskSnapshot, notes.value)
+      if (!diff.hasAnyDiff) return
+
+      // Handle current open note if it changed on disk
+      const current = currentNote.value
+      if (current && current.relativePath) {
+        if (!diskSnapshot.has(current.relativePath)) {
+          // File was deleted or moved on disk externally (F2-01)
+          if (current.isDirty) {
+            current.hasConflict = true
+            current.conflictType = 'deleted'
+            current.diskState = 'missing'
+          }
+        } else {
+          const curDisk = diskSnapshot.get(current.relativePath)!
+          const curLast = lastDiskSnapshot.get(current.relativePath)
+          const isCurModified = curDisk && (
+            (curLast && (curDisk.mtime !== curLast.mtime || curDisk.size !== curLast.size)) ||
+            (current.mtime && curDisk.mtime > current.mtime + 500)
+          )
+
+          if (isCurModified) {
+            const raw = await fs.readVaultTextFile(vaultPath, current.relativePath)
+            const { frontmatter, body } = extractFrontmatterAndBody(raw)
+
+            if (current.isDirty) {
+              current.hasConflict = true
+              current.conflictType = 'modified'
+              current.conflictContent = body
+            } else {
+              current.content = body
+              current.frontmatter = frontmatter as BossBrainFrontmatter
+              current.title = frontmatter.title || current.title
+              current.mtime = curDisk.mtime
+              ;(current as any).size = curDisk.size
+              current.hasConflict = false
+              current.conflictType = undefined
+              current.diskState = 'normal'
+            }
+          }
+        }
+      }
+
+      // Safe refresh of vault
+      await rescanVault(false)
+    } catch (e) {
+      console.warn('Error checking external vault changes:', e)
+    }
+  }
+
+  async function resolveConflict(noteId: string, choice: 'keep-local' | 'keep-disk' | 'conflict-copy'): Promise<void> {
+    const note = notes.value.find(n => n.id === noteId)
+    if (!note) return
+
+    await resolveNoteConflict(note, choice, {
+      saveNote: async (targetNote) => {
+        await saveNoteToStorage(targetNote)
+      },
+      createRecoveredNote: async (title, content, sourceNote) => {
+        return await createRecoveredNote(title, content, sourceNote)
+      },
+      deleteFromMemory: (id) => {
+        const idx = notes.value.findIndex(n => n.id === id)
+        if (idx !== -1) {
+          notes.value.splice(idx, 1)
+          if (currentNoteId.value === id) {
+            currentNoteId.value = notes.value[0]?.id || ''
+          }
+        }
+      },
+    })
+  }
+
+  async function rescanVault(forceRebuild = false): Promise<void> {
+    if (!settingStore.settings.enableBossBrain || !settingStore.settings.vaultPath) return
+    const vaultPath = settingStore.settings.vaultPath
+
+    isLoading.value = true
+    try {
+      const scanned = await vaultIndexer.scanVault(vaultPath, forceRebuild)
+      const oldId = currentNoteId.value
+
+      const { mergedNotes, isEmptyVault } = mergeScannedWithPreservedNotes(scanned, notes.value)
+
+      if (!isEmptyVault) {
+        notes.value = mergedNotes
+        updateDiskSnapshot(scanned)
+
+        if (oldId && mergedNotes.some(n => n.id === oldId)) {
+          currentNoteId.value = oldId
+        } else if (mergedNotes.length > 0) {
+          currentNoteId.value = mergedNotes[0].id
+        }
+      } else {
+        // Truly empty vault with NO dirty notes in memory (F1-03 & F2-02)
+        notes.value = []
+        lastDiskSnapshot.clear()
+        await createNoteAtHead()
+      }
+    } catch (e) {
+      console.error('Failed to rescan vault:', e)
+    } finally {
+      isLoading.value = false
+    }
+  }
+
+  function navigateToWikilink(target: string): boolean {
+    const found = resolveWikilinkTarget(target, notes.value)
+    if (found) {
+      selectNote(found.id)
+      return true
+    }
+    return false
+  }
+
   async function initialize(): Promise<void> {
     await loadNotes()
   }
 
-  // Helper function to extract title from content
   function extractTitle(content: string): string {
-    // 只取第一行，避免对大内容做整串 trim + split
     const firstLine = content.trimStart().split('\n', 1)[0]?.trim() || ''
     if (firstLine.startsWith('#')) {
       return firstLine.replace(/^#+\s*/, '').substring(0, 50)
@@ -757,10 +999,16 @@ export const useNoteStore = defineStore('note', () => {
     navigatePrevOrCreate,
     navigateNextOrCreate,
     pinToTop,
-    // iCloud persistence
+    // Boss Brain Specific Actions
+    checkExternalChanges,
+    resolveConflict,
+    rescanVault,
+    navigateToWikilink,
+    // Persistence
     initialize,
     loadNotes,
-    saveNoteToCloud,
+    saveNoteToStorage,
+    saveNoteToCloud: saveNoteToStorage,
     saveMetadataToCloud,
   }
 })
