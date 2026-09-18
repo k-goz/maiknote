@@ -13,7 +13,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "sync-version": "node scripts/sync-version.js",
-    "test": "node --experimental-strip-types --test tests/unit.test.mjs tests/integration.test.mjs tests/bossbrain.test.mjs tests/e2e-verification.mjs",
+    "test": "node --experimental-strip-types --test tests/unit.test.mjs tests/integration.test.mjs tests/bossbrain.test.mjs tests/filesystem-integration.test.mjs",
     "pretauri": "npm run sync-version",
     "postinstall": "patch-package"
   },

@@ -28,6 +28,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+          cache-workspaces: "src-tauri"
 
       - name: Install Dependencies
         run: npm ci

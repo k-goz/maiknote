@@ -6,22 +6,27 @@ import os from 'node:os'
 
 // Directly import production modules (F2-06 rule)
 import { extractFrontmatterAndBody, stringifyWithFrontmatter } from '../src/utils/frontmatter.ts'
-import { slugify, generateBossBrainFilename, formatISO8601WithOffset } from '../src/utils/slug.ts'
+import { slugify, generateBossBrainFilename, formatFilenameDate, formatISO8601WithOffset } from '../src/utils/slug.ts'
 import { extractWikilinks, resolveWikilinkTarget, computeBacklinks } from '../src/utils/wikilink.ts'
 import { diffVaultSnapshot, mergeScannedWithPreservedNotes } from '../src/services/vaultChangeDetector.ts'
 import { resolveNoteConflict } from '../src/services/conflictResolver.ts'
 
-console.log('=== BOSS BRAIN V1 F2 REAL E2E VERIFICATION SUITE ===')
+console.log('=== BOSS BRAIN V1 PRODUCTION-CODE FILESYSTEM INTEGRATION SUITE ===')
 
 test('Scenario A: Quick Capture & Real Disk File Persistence', async () => {
-  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bossbrain-e2e-vault-'))
+  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bossbrain-fs-vault-'))
   const inboxDir = path.join(vaultDir, '00-Inbox')
   fs.mkdirSync(inboxDir, { recursive: true })
 
   try {
     const title = 'HealthTwin 首页应该加强 CTA'
-    const filename = generateBossBrainFilename(title, new Date('2026-09-18T10:30:00+08:00'))
-    assert.match(filename, /^2026-09-18-1030--healthtwin-首页应该加强-cta-[0-9a-f]{4}\.md$/)
+    const now = new Date(2026, 8, 18, 10, 30) // Explicit components, timezone independent
+    const filename = generateBossBrainFilename(title, now)
+    
+    // Timezone invariant assertion: filename matches pattern and starts with formatFilenameDate(now)
+    assert.match(filename, /^\d{4}-\d{2}-\d{2}-\d{4}--healthtwin-首页应该加强-cta-[0-9a-f]{4}\.md$/)
+    const expectedPrefix = formatFilenameDate(now)
+    assert.ok(filename.startsWith(`${expectedPrefix}--`))
 
     const relPath = `00-Inbox/${filename}`
     const fullPath = path.join(vaultDir, relPath)
@@ -29,8 +34,8 @@ test('Scenario A: Quick Capture & Real Disk File Persistence', async () => {
     const frontmatter = {
       id: '2026-09-18-1030-healthtwin-home-cta-test',
       title,
-      created: formatISO8601WithOffset(new Date('2026-09-18T10:30:00+08:00')),
-      updated: formatISO8601WithOffset(new Date('2026-09-18T10:30:00+08:00')),
+      created: formatISO8601WithOffset(now),
+      updated: formatISO8601WithOffset(now),
       type: 'note',
       status: 'inbox',
       source: 'maiknote',
@@ -61,7 +66,7 @@ test('Scenario A: Quick Capture & Real Disk File Persistence', async () => {
 })
 
 test('Scenario B1: External AI Modification of Non-Current Note', async () => {
-  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bossbrain-e2e-vault-'))
+  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bossbrain-fs-vault-'))
   const inboxDir = path.join(vaultDir, '00-Inbox')
   fs.mkdirSync(inboxDir, { recursive: true })
 
@@ -116,22 +121,30 @@ test('Scenario B1: External AI Modification of Non-Current Note', async () => {
   }
 })
 
-test('Scenario B2: External Conflict Handling (3 Branches)', async () => {
-  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bossbrain-e2e-vault-'))
+test('Scenario B2: External Conflict Handling (3 Branches with Frontmatter Preservation)', async () => {
+  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bossbrain-fs-vault-'))
   const inboxDir = path.join(vaultDir, '00-Inbox')
   fs.mkdirSync(inboxDir, { recursive: true })
 
   try {
     const fileA = '00-Inbox/A.md'
+    const originalFm = {
+      id: 'note-A',
+      title: 'HealthTwin Project',
+      project: 'HealthTwin',
+      tags: ['growth', 'ux'],
+      source: 'maiknote',
+    }
 
     // Helper to simulate conflict on A.md
     const setupConflictNote = () => {
-      fs.writeFileSync(path.join(vaultDir, fileA), stringifyWithFrontmatter({ id: 'note-A', title: 'Note A' }, 'Disk Content V1'), 'utf-8')
+      fs.writeFileSync(path.join(vaultDir, fileA), stringifyWithFrontmatter(originalFm, 'Disk Content V1'), 'utf-8')
       const note = {
         id: 'note-A',
-        title: 'Note A',
+        title: 'HealthTwin Project',
         content: 'Local User Edits V2',
         relativePath: fileA,
+        frontmatter: { ...originalFm },
         isDirty: true,
         hasConflict: true,
         conflictType: 'modified',
@@ -140,32 +153,38 @@ test('Scenario B2: External Conflict Handling (3 Branches)', async () => {
       return note
     }
 
-    // Branch 1: keep-local
+    // Branch 1: keep-local preserves Frontmatter
     {
       const noteA = setupConflictNote()
       await resolveNoteConflict(noteA, 'keep-local', {
-        writeVaultTextFile: async (rel, content) => {
-          fs.writeFileSync(path.join(vaultDir, rel), stringifyWithFrontmatter({ id: noteA.id, title: noteA.title }, content), 'utf-8')
-          const stat = fs.statSync(path.join(vaultDir, rel))
-          return { modified_ms: stat.mtimeMs, size: stat.size }
+        saveNote: async (targetNote) => {
+          const full = stringifyWithFrontmatter(targetNote.frontmatter || {}, targetNote.content)
+          fs.writeFileSync(path.join(vaultDir, targetNote.relativePath), full, 'utf-8')
         },
-        createNoteWithContent: async () => {},
+        createRecoveredNote: async () => {},
         deleteFromMemory: () => {},
       })
       assert.equal(noteA.hasConflict, false)
       assert.equal(noteA.isDirty, false)
       assert.equal(noteA.content, 'Local User Edits V2')
       const diskText = fs.readFileSync(path.join(vaultDir, fileA), 'utf-8')
-      assert.ok(diskText.includes('Local User Edits V2'))
-      console.log('  ✔ B2 Branch 1 (keep-local) passed')
+      const parsed = extractFrontmatterAndBody(diskText)
+      assert.equal(parsed.hasFrontmatter, true)
+      assert.equal(parsed.frontmatter.id, 'note-A')
+      assert.equal(parsed.frontmatter.title, 'HealthTwin Project')
+      assert.equal(parsed.frontmatter.project, 'HealthTwin')
+      assert.deepEqual(parsed.frontmatter.tags, ['growth', 'ux'])
+      assert.equal(parsed.frontmatter.source, 'maiknote')
+      assert.equal(parsed.body.trim(), 'Local User Edits V2')
+      console.log('  ✔ B2 Branch 1 (keep-local with full Frontmatter preservation) passed')
     }
 
     // Branch 2: keep-disk
     {
       const noteA = setupConflictNote()
       await resolveNoteConflict(noteA, 'keep-disk', {
-        writeVaultTextFile: async () => ({ modified_ms: 0, size: 0 }),
-        createNoteWithContent: async () => {},
+        saveNote: async () => {},
+        createRecoveredNote: async () => {},
         deleteFromMemory: () => {},
       })
       assert.equal(noteA.hasConflict, false)
@@ -174,45 +193,66 @@ test('Scenario B2: External Conflict Handling (3 Branches)', async () => {
       console.log('  ✔ B2 Branch 2 (keep-disk) passed')
     }
 
-    // Branch 3: conflict-copy
+    // Branch 3: conflict-copy with full Frontmatter in 00-Inbox/
     {
       const noteA = setupConflictNote()
       let copyCreated = false
       await resolveNoteConflict(noteA, 'conflict-copy', {
-        writeVaultTextFile: async () => ({ modified_ms: 0, size: 0 }),
-        createNoteWithContent: async (title, content) => {
+        saveNote: async () => {},
+        createRecoveredNote: async (title, content, sourceNote) => {
           copyCreated = true
-          assert.equal(title, 'Note A (Conflict Copy)')
+          assert.equal(title, 'HealthTwin Project (Conflict Copy)')
           assert.equal(content, 'Local User Edits V2')
-          fs.writeFileSync(path.join(vaultDir, '00-Inbox/conflict-copy.md'), content, 'utf-8')
+          const fm = {
+            id: 'copy-123',
+            title,
+            project: sourceNote?.frontmatter?.project || '',
+            tags: sourceNote?.frontmatter?.tags || [],
+            source: 'conflict-recovery',
+          }
+          const full = stringifyWithFrontmatter(fm, content)
+          fs.writeFileSync(path.join(vaultDir, '00-Inbox/conflict-copy.md'), full, 'utf-8')
         },
         deleteFromMemory: () => {},
       })
       assert.equal(copyCreated, true)
       assert.equal(noteA.hasConflict, false)
       assert.equal(noteA.content, 'Disk External Content V3')
-      console.log('  ✔ B2 Branch 3 (conflict-copy) passed')
+      const copyParsed = extractFrontmatterAndBody(fs.readFileSync(path.join(vaultDir, '00-Inbox/conflict-copy.md'), 'utf-8'))
+      assert.equal(copyParsed.hasFrontmatter, true)
+      assert.equal(copyParsed.frontmatter.project, 'HealthTwin')
+      assert.deepEqual(copyParsed.frontmatter.tags, ['growth', 'ux'])
+      assert.equal(copyParsed.frontmatter.source, 'conflict-recovery')
+      console.log('  ✔ B2 Branch 3 (conflict-copy with full Frontmatter) passed')
     }
   } finally {
     fs.rmSync(vaultDir, { recursive: true, force: true })
   }
 })
 
-test('Scenario B3: [F2-01] External Deletion of Dirty Note', async () => {
-  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bossbrain-e2e-vault-'))
+test('Scenario B3: [F2-01 & F3-01] External Deletion of Dirty Note & Keep-Local Frontmatter Preservation', async () => {
+  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bossbrain-fs-vault-'))
   const inboxDir = path.join(vaultDir, '00-Inbox')
   fs.mkdirSync(inboxDir, { recursive: true })
 
   try {
     const fileA = '00-Inbox/A.md'
-    fs.writeFileSync(path.join(vaultDir, fileA), stringifyWithFrontmatter({ id: 'note-A', title: 'Note A' }, 'Original Disk Content'), 'utf-8')
+    const originalFm = {
+      id: 'note-A',
+      title: 'Original Title',
+      project: 'HealthTwin',
+      tags: ['data-safety'],
+      source: 'maiknote',
+    }
+    fs.writeFileSync(path.join(vaultDir, fileA), stringifyWithFrontmatter(originalFm, 'Original Disk Content'), 'utf-8')
 
     // Local user is modifying Note A
     const activeNotes = [{
       id: 'note-A',
-      title: 'Note A',
+      title: 'Original Title',
       content: 'Critical Unsaved Notes',
       relativePath: fileA,
+      frontmatter: { ...originalFm },
       isDirty: true,
       hasConflict: false,
     }]
@@ -225,7 +265,7 @@ test('Scenario B3: [F2-01] External Deletion of Dirty Note', async () => {
     const scanned = []
     const { mergedNotes, isEmptyVault } = mergeScannedWithPreservedNotes(scanned, activeNotes)
 
-    // F2-01 & F2-02 Verification:
+    // Verification:
     assert.equal(isEmptyVault, false, 'Must not be considered empty vault while dirty notes exist')
     assert.equal(mergedNotes.length, 1, 'Dirty note MUST NOT be deleted')
     const protectedNote = mergedNotes[0]
@@ -235,29 +275,36 @@ test('Scenario B3: [F2-01] External Deletion of Dirty Note', async () => {
     assert.equal(protectedNote.conflictType, 'deleted')
     assert.equal(protectedNote.diskState, 'missing')
 
-    // Verify recovery via keep-local recreates the file on disk
+    // Verify recovery via keep-local recreates the file on disk WITH FULL FRONTMATTER
     await resolveNoteConflict(protectedNote, 'keep-local', {
-      writeVaultTextFile: async (rel, content) => {
-        fs.writeFileSync(path.join(vaultDir, rel), content, 'utf-8')
-        const stat = fs.statSync(path.join(vaultDir, rel))
-        return { modified_ms: stat.mtimeMs, size: stat.size }
+      saveNote: async (targetNote) => {
+        const full = stringifyWithFrontmatter(targetNote.frontmatter || {}, targetNote.content)
+        fs.writeFileSync(path.join(vaultDir, targetNote.relativePath), full, 'utf-8')
       },
-      createNoteWithContent: async () => {},
+      createRecoveredNote: async () => {},
       deleteFromMemory: () => {},
     })
 
     assert.equal(protectedNote.hasConflict, false)
     assert.equal(protectedNote.diskState, 'normal')
     assert.ok(fs.existsSync(path.join(vaultDir, fileA)), 'File recreated on disk by keep-local')
-    assert.equal(fs.readFileSync(path.join(vaultDir, fileA), 'utf-8'), 'Critical Unsaved Notes')
-    console.log('✔ Scenario B3 verified: Deleted dirty note protected and successfully recovered to disk')
+
+    const diskText = fs.readFileSync(path.join(vaultDir, fileA), 'utf-8')
+    const parsed = extractFrontmatterAndBody(diskText)
+    assert.equal(parsed.hasFrontmatter, true)
+    assert.equal(parsed.frontmatter.id, 'note-A')
+    assert.equal(parsed.frontmatter.project, 'HealthTwin')
+    assert.deepEqual(parsed.frontmatter.tags, ['data-safety'])
+    assert.equal(parsed.frontmatter.source, 'maiknote')
+    assert.equal(parsed.body.trim(), 'Critical Unsaved Notes')
+    console.log('✔ Scenario B3 verified: Deleted dirty note recovered to disk with complete Frontmatter')
   } finally {
     fs.rmSync(vaultDir, { recursive: true, force: true })
   }
 })
 
 test('Scenario C: Rebuilding Index Without Cache', async () => {
-  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bossbrain-e2e-vault-'))
+  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bossbrain-fs-vault-'))
   const inboxDir = path.join(vaultDir, '00-Inbox')
   const knowledgeDir = path.join(vaultDir, '03-Knowledge')
   const cacheDir = path.join(vaultDir, '.bossbrain')
@@ -311,7 +358,7 @@ test('Scenario C: Rebuilding Index Without Cache', async () => {
 })
 
 test('Scenario D: Obsidian Interoperability & Asset Resolution', async () => {
-  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bossbrain-e2e-vault-'))
+  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bossbrain-fs-vault-'))
   const inboxDir = path.join(vaultDir, '00-Inbox')
   const projectsDir = path.join(vaultDir, '01-Projects/HealthTwin')
   const assetsDir = path.join(vaultDir, '_assets')

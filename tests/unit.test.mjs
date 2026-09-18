@@ -120,3 +120,18 @@ test('[UNIT] 6. [F2-05] Disk-accurate byte length vs character length for UTF-8 
   // Demonstrates why disk size metadata must use byte length rather than text.length
   // to avoid spurious diff detections when comparing disk snapshot with in-memory size.
 })
+
+test('[UNIT] 7. [F3-03] Timezone-independent filename format invariant', () => {
+  const title = 'HealthTwin 首页应该加强 CTA'
+  const date = new Date(2026, 8, 18, 10, 30) // Explicit components
+  const filename = generateBossBrainFilename(title, date)
+  const expectedPrefix = formatFilenameDate(date)
+
+  // Invariant 1: starts with formatFilenameDate
+  assert.ok(filename.startsWith(`${expectedPrefix}--`))
+  // Invariant 2: matches full regex structure YYYY-MM-DD-HHmm--<slug>-<hash>.md
+  assert.match(filename, /^\d{4}-\d{2}-\d{2}-\d{4}--healthtwin-首页应该加强-cta-[0-9a-f]{4}\.md$/)
+  // Invariant 3: ISO 8601 with offset contains timezone offset and is valid ISO date
+  const iso = formatISO8601WithOffset(date)
+  assert.match(iso, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/)
+})

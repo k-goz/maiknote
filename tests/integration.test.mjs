@@ -157,26 +157,40 @@ class MockVaultEnvironment {
     if (!note) return
 
     await resolveNoteConflict(note, choice, {
-      writeVaultTextFile: async (relPath, content) => {
-        const full = stringifyWithFrontmatter(note.frontmatter || {}, content)
-        this.writeVaultTextFile(relPath, full)
-        const stat = fs.statSync(path.join(this.vaultDir, relPath))
-        this.lastDiskSnapshot.set(relPath, { mtime: stat.mtimeMs, size: stat.size })
-        return { modified_ms: stat.mtimeMs, size: stat.size }
+      saveNote: async (targetNote) => {
+        const full = stringifyWithFrontmatter(targetNote.frontmatter || {}, targetNote.content)
+        this.writeVaultTextFile(targetNote.relativePath, full)
+        const stat = fs.statSync(path.join(this.vaultDir, targetNote.relativePath))
+        targetNote.mtime = stat.mtimeMs
+        targetNote.size = stat.size
+        this.lastDiskSnapshot.set(targetNote.relativePath, { mtime: stat.mtimeMs, size: stat.size })
+        targetNote.isDirty = false
       },
-      createNoteWithContent: async (title, content) => {
+      createRecoveredNote: async (title, content, sourceNote) => {
         const rel = `00-Inbox/${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Date.now()}.md`
-        const full = stringifyWithFrontmatter({ id: `copy-${Date.now()}`, title }, content)
+        const fm = {
+          id: `rec-${Date.now()}`,
+          title,
+          created: new Date().toISOString(),
+          updated: new Date().toISOString(),
+          type: 'note',
+          status: 'inbox',
+          project: sourceNote?.project || sourceNote?.frontmatter?.project || '',
+          tags: [...(sourceNote?.tags || sourceNote?.frontmatter?.tags || [])],
+          source: 'conflict-recovery',
+        }
+        const full = stringifyWithFrontmatter(fm, content)
         this.writeVaultTextFile(rel, full)
         const stat = fs.statSync(path.join(this.vaultDir, rel))
         const newNote = {
-          id: `copy-${Date.now()}`,
+          id: fm.id,
           title,
           content,
           relativePath: rel,
           mtime: stat.mtimeMs,
           size: stat.size,
           isDirty: false,
+          frontmatter: fm,
         }
         this.notes.push(newNote)
         this.lastDiskSnapshot.set(rel, { mtime: stat.mtimeMs, size: stat.size })
@@ -533,4 +547,142 @@ test('[INTEGRATION] 12. [F2-02] Empty vault on disk does NOT wipe dirty/conflict
     env.cleanup()
   }
 })
+
+test('[INTEGRATION] 13. [F3-01] Modified conflict keep-local strictly preserves full Frontmatter', async () => {
+  const env = new MockVaultEnvironment()
+  try {
+    const originalFm = {
+      id: 'abc',
+      title: 'HealthTwin',
+      project: 'HealthTwin',
+      tags: ['ux'],
+      source: 'maiknote',
+    }
+    env.writeVaultTextFile('00-Inbox/A.md', stringifyWithFrontmatter(originalFm, 'Old body'))
+    await env.rescanVault()
+    env.currentNoteId = 'abc'
+
+    const noteA = env.notes.find(n => n.id === 'abc')
+    // Local user edits body
+    noteA.content = 'New local body'
+    noteA.isDirty = true
+
+    // External agent modifies A.md concurrently
+    await new Promise(r => setTimeout(r, 20))
+    env.writeVaultTextFile('00-Inbox/A.md', stringifyWithFrontmatter({ ...originalFm, title: 'HealthTwin Disk' }, 'Disk modified body'))
+
+    // Trigger conflict check
+    await env.checkExternalChanges()
+    assert.equal(noteA.hasConflict, true)
+
+    // User chooses keep-local
+    await env.resolveConflict('abc', 'keep-local')
+
+    // Verify physical file on disk
+    const diskRaw = env.readVaultTextFile('00-Inbox/A.md')
+    const parsed = extractFrontmatterAndBody(diskRaw)
+    assert.equal(parsed.hasFrontmatter, true)
+    assert.equal(parsed.frontmatter.id, 'abc')
+    assert.equal(parsed.frontmatter.title, 'HealthTwin')
+    assert.equal(parsed.frontmatter.project, 'HealthTwin')
+    assert.deepEqual(parsed.frontmatter.tags, ['ux'])
+    assert.equal(parsed.frontmatter.source, 'maiknote')
+    assert.equal(parsed.body.trim(), 'New local body')
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('[INTEGRATION] 14. [F3-01] Deleted conflict keep-local strictly preserves full Frontmatter', async () => {
+  const env = new MockVaultEnvironment()
+  try {
+    const originalFm = {
+      id: 'note-del-recovery',
+      title: 'Architecture Blueprint',
+      project: 'CoreEngine',
+      tags: ['arch', 'backend'],
+      source: 'maiknote',
+      type: 'note',
+      status: 'inbox',
+    }
+    env.writeVaultTextFile('00-Inbox/blueprint.md', stringifyWithFrontmatter(originalFm, 'Draft Blueprint Content'))
+    await env.rescanVault()
+
+    const note = env.notes.find(n => n.id === 'note-del-recovery')
+    note.content = 'Draft Blueprint Content with Unsaved Local Changes'
+    note.isDirty = true
+
+    // External process physically deletes the file
+    env.deleteVaultFile('00-Inbox/blueprint.md')
+
+    // Detect deletion
+    await env.checkExternalChanges()
+    const updatedNote = env.notes.find(n => n.id === 'note-del-recovery')
+    assert.ok(updatedNote)
+    assert.equal(updatedNote.hasConflict, true)
+    assert.equal(updatedNote.conflictType, 'deleted')
+    assert.equal(updatedNote.diskState, 'missing')
+
+    // User resolves with keep-local to resurrect file
+    await env.resolveConflict('note-del-recovery', 'keep-local')
+
+    // Verify file recreated on disk with full Frontmatter
+    const diskRaw = env.readVaultTextFile('00-Inbox/blueprint.md')
+    const parsed = extractFrontmatterAndBody(diskRaw)
+    assert.equal(parsed.hasFrontmatter, true)
+    assert.equal(parsed.frontmatter.id, 'note-del-recovery')
+    assert.equal(parsed.frontmatter.title, 'Architecture Blueprint')
+    assert.equal(parsed.frontmatter.project, 'CoreEngine')
+    assert.deepEqual(parsed.frontmatter.tags, ['arch', 'backend'])
+    assert.equal(parsed.frontmatter.source, 'maiknote')
+    assert.equal(parsed.body.trim(), 'Draft Blueprint Content with Unsaved Local Changes')
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('[INTEGRATION] 15. [F3-02] Recovered copy note has complete Frontmatter and is saved in 00-Inbox/', async () => {
+  const env = new MockVaultEnvironment()
+  try {
+    const originalFm = {
+      id: 'src-123',
+      title: 'Meeting Notes',
+      project: 'Alpha',
+      tags: ['meeting', 'q3'],
+      source: 'maiknote',
+    }
+    env.writeVaultTextFile('00-Inbox/meeting.md', stringifyWithFrontmatter(originalFm, 'Initial meeting notes'))
+    await env.rescanVault()
+
+    const note = env.notes.find(n => n.id === 'src-123')
+    note.content = 'Unsaved local notes to be recovered'
+    note.isDirty = true
+
+    // External deletion
+    env.deleteVaultFile('00-Inbox/meeting.md')
+    await env.checkExternalChanges()
+
+    // User resolves with conflict-copy
+    await env.resolveConflict('src-123', 'conflict-copy')
+
+    // Check recovered note in 00-Inbox/
+    const inboxFiles = env.scanVaultFiles().filter(f => f.relative_path.startsWith('00-Inbox/') && f.relative_path.includes('recovered'))
+    assert.equal(inboxFiles.length, 1)
+
+    const raw = env.readVaultTextFile(inboxFiles[0].relative_path)
+    const parsed = extractFrontmatterAndBody(raw)
+    assert.equal(parsed.hasFrontmatter, true)
+    assert.ok(parsed.frontmatter.id)
+    assert.ok(parsed.frontmatter.title.includes('Meeting Notes (Recovered)'))
+    assert.equal(parsed.frontmatter.project, 'Alpha')
+    assert.deepEqual(parsed.frontmatter.tags, ['meeting', 'q3'])
+    assert.equal(parsed.frontmatter.source, 'conflict-recovery')
+    assert.equal(parsed.frontmatter.type, 'note')
+    assert.equal(parsed.frontmatter.status, 'inbox')
+    assert.equal(parsed.body.trim(), 'Unsaved local notes to be recovered')
+  } finally {
+    env.cleanup()
+  }
+})
+
 

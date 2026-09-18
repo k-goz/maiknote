@@ -177,33 +177,7 @@ export const useNoteStore = defineStore('note', () => {
 
       for (const note of notesToSave) {
         try {
-          if (settingStore.settings.enableBossBrain && settingStore.settings.vaultPath && note.relativePath) {
-            const vaultPath = settingStore.settings.vaultPath
-            const frontmatter: BossBrainFrontmatter = {
-              id: note.id,
-              title: note.title,
-              created: formatISO8601WithOffset(new Date(note.createdAt)),
-              updated: formatISO8601WithOffset(new Date(note.updatedAt)),
-              type: note.type || 'note',
-              status: note.status || 'inbox',
-              project: note.project || '',
-              tags: note.tags || [],
-              source: note.source || 'maiknote',
-              ...(note.frontmatter || {}),
-              isPinned: note.isPinned,
-              isLocked: note.isLocked,
-              backgroundColor: note.backgroundColor,
-            }
-            note.frontmatter = frontmatter
-            const fullMarkdown = stringifyWithFrontmatter(frontmatter, note.content)
-            const writeRes = await fs.writeVaultTextFile(vaultPath, note.relativePath, fullMarkdown)
-            note.isDirty = false
-            note.mtime = writeRes.modified_ms
-            ;(note as any).size = writeRes.size
-            lastDiskSnapshot.set(note.relativePath, { mtime: writeRes.modified_ms, size: writeRes.size })
-          } else {
-            await fs.writeNote(note.id, note.content, note.directoryId)
-          }
+          await saveNoteToStorage(note)
         } catch (e) {
           console.error('Failed to save note:', e)
         }
@@ -344,13 +318,13 @@ export const useNoteStore = defineStore('note', () => {
           id: note.id,
           title: note.title,
           created: formatISO8601WithOffset(new Date(note.createdAt)),
-          updated: formatISO8601WithOffset(new Date(note.updatedAt)),
           type: note.type || 'note',
           status: note.status || 'inbox',
           project: note.project || '',
           tags: note.tags || [],
           source: note.source || 'maiknote',
           ...(note.frontmatter || {}),
+          updated: formatISO8601WithOffset(new Date(note.updatedAt || Date.now())),
           isPinned: note.isPinned,
           isLocked: note.isLocked,
           backgroundColor: note.backgroundColor,
@@ -524,6 +498,58 @@ export const useNoteStore = defineStore('note', () => {
     }
     navDirection.value = 'right'
     currentNoteId.value = newNote.id
+    await saveNoteToStorage(newNote)
+    return newNote
+  }
+
+  async function createRecoveredNote(title: string, content: string, sourceNote?: Note): Promise<Note> {
+    const now = Date.now()
+    const filename = generateBossBrainFilename(title, new Date(now))
+    // F3-02: Recovery V1 defaults strictly to 00-Inbox/ regardless of active directory
+    const relativePath = `00-Inbox/${filename}`
+    const id = generateNoteId(title, new Date(now))
+
+    const frontmatter: BossBrainFrontmatter = {
+      id,
+      title,
+      created: formatISO8601WithOffset(new Date(now)),
+      updated: formatISO8601WithOffset(new Date(now)),
+      type: 'note',
+      status: 'inbox',
+      project: sourceNote?.project || sourceNote?.frontmatter?.project || '',
+      tags: [...(sourceNote?.tags || sourceNote?.frontmatter?.tags || [])],
+      source: 'conflict-recovery',
+    }
+
+    const newNote: Note = {
+      id,
+      title,
+      content,
+      createdAt: now,
+      updatedAt: now,
+      tags: frontmatter.tags,
+      isPinned: false,
+      isLocked: false,
+      relativePath,
+      isDirty: false,
+      frontmatter,
+      project: frontmatter.project,
+      type: 'note',
+      status: 'inbox',
+      source: 'conflict-recovery',
+      diskState: 'normal',
+      hasConflict: false,
+    }
+
+    const currentIndex = notes.value.findIndex(n => n.id === currentNoteId.value)
+    if (currentIndex !== -1) {
+      notes.value.splice(currentIndex + 1, 0, newNote)
+    } else {
+      notes.value.push(newNote)
+    }
+    navDirection.value = 'right'
+    currentNoteId.value = newNote.id
+
     await saveNoteToStorage(newNote)
     return newNote
   }
@@ -867,14 +893,11 @@ export const useNoteStore = defineStore('note', () => {
     if (!note) return
 
     await resolveNoteConflict(note, choice, {
-      writeVaultTextFile: async (rel, content) => {
-        const vaultPath = settingStore.settings.vaultPath!
-        const res = await fs.writeVaultTextFile(vaultPath, rel, content)
-        lastDiskSnapshot.set(rel, { mtime: res.modified_ms, size: res.size })
-        return res
+      saveNote: async (targetNote) => {
+        await saveNoteToStorage(targetNote)
       },
-      createNoteWithContent: async (title, content) => {
-        return await createNoteWithContent(title, content)
+      createRecoveredNote: async (title, content, sourceNote) => {
+        return await createRecoveredNote(title, content, sourceNote)
       },
       deleteFromMemory: (id) => {
         const idx = notes.value.findIndex(n => n.id === id)
