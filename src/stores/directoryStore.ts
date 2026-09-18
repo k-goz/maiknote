@@ -2,9 +2,11 @@ import { defineStore } from 'pinia'
 import { ref, computed, watch } from 'vue'
 import type { Directory, DirectoryData } from '@/types/note'
 import { useFileSystem } from '@/composables/useFileSystem'
+import { useSettingStore } from '@/stores/settingStore'
 
 export const useDirectoryStore = defineStore('directory', () => {
   const fs = useFileSystem()
+  const settingStore = useSettingStore()
 
   // State
   const directories = ref<Directory[]>([])
@@ -22,7 +24,6 @@ export const useDirectoryStore = defineStore('directory', () => {
   function restoreLastDirectory(): string | null {
     const saved = localStorage.getItem('lastSelectedDirectoryId')
     if (saved && saved !== '') {
-      // 确保该目录仍然存在
       const dir = directories.value.find(d => d.id === saved)
       if (dir) {
         currentDirectoryId.value = saved
@@ -77,6 +78,60 @@ export const useDirectoryStore = defineStore('directory', () => {
     isLoading.value = true
 
     try {
+      if (settingStore.settings.enableBossBrain) {
+        const standardFolders = [
+          '00-Inbox',
+          '01-Projects',
+          '02-Areas',
+          '03-Knowledge',
+          '04-Playbooks',
+          '05-Decisions',
+          '90-Archive',
+        ]
+
+        const now = Date.now()
+        const dirs: Directory[] = standardFolders.map(name => ({
+          id: name,
+          name,
+          parentId: null,
+          createdAt: now,
+          updatedAt: now,
+        }))
+
+        // Also check if any subfolders exist in the vault
+        if (settingStore.settings.vaultPath) {
+          try {
+            const files = await fs.scanVaultFiles(settingStore.settings.vaultPath)
+            const subfolderSet = new Set<string>()
+
+            for (const f of files) {
+              const parts = f.relative_path.split('/')
+              if (parts.length > 2) {
+                // e.g. 01-Projects/TestProject/README.md -> parent is parts[0], subfolder is parts.slice(0, 2).join('/')
+                const parentId = parts[0]
+                const subfolderId = parts.slice(0, 2).join('/')
+                const subfolderName = parts[1]
+                if (!subfolderSet.has(subfolderId) && !subfolderName.startsWith('.')) {
+                  subfolderSet.add(subfolderId)
+                  dirs.push({
+                    id: subfolderId,
+                    name: subfolderName,
+                    parentId,
+                    createdAt: now,
+                    updatedAt: now,
+                  })
+                }
+              }
+            }
+          } catch (e) {
+            console.warn('Failed scanning subfolders in vault:', e)
+          }
+        }
+
+        directories.value = dirs
+        return
+      }
+
       const data = await fs.readDirectories()
       directories.value = data.directories
     } catch (e) {
@@ -87,6 +142,9 @@ export const useDirectoryStore = defineStore('directory', () => {
   }
 
   async function saveDirectories(): Promise<void> {
+    if (settingStore.settings.enableBossBrain) {
+      return
+    }
     const data: DirectoryData = {
       version: 1,
       directories: directories.value,
@@ -96,17 +154,28 @@ export const useDirectoryStore = defineStore('directory', () => {
 
   async function createDirectory(name: string, parentId: string | null = null): Promise<Directory> {
     const now = Date.now()
+    const folderId = parentId ? `${parentId}/${name}` : name
     const newDir: Directory = {
-      id: crypto.randomUUID(),
+      id: folderId,
       name,
       parentId,
       createdAt: now,
       updatedAt: now,
     }
     directories.value.push(newDir)
-    // 在 iCloud 中创建实际文件夹（以 ID 命名）
-    await fs.createDirectoryFolder(newDir.id)
-    await saveDirectories()
+
+    if (settingStore.settings.enableBossBrain && settingStore.settings.vaultPath) {
+      // In Boss Brain mode, ensure vault folder exists
+      try {
+        await fs.writeVaultTextFile(settingStore.settings.vaultPath, `${folderId}/.keep`, '')
+      } catch (e) {
+        console.warn('Failed creating vault directory:', e)
+      }
+    } else {
+      await fs.createDirectoryFolder(newDir.id)
+      await saveDirectories()
+    }
+
     return newDir
   }
 
@@ -168,16 +237,15 @@ export const useDirectoryStore = defineStore('directory', () => {
     if (!dir) return
     const parentId = dir.parentId
 
-    // 删除 iCloud 中的实际文件夹（.md 文件会被移回根目录）
-    await fs.deleteDirectoryFolder(id)
+    if (!settingStore.settings.enableBossBrain) {
+      await fs.deleteDirectoryFolder(id)
+    }
 
-    // 删除目录自身
     const index = directories.value.findIndex(d => d.id === id)
     if (index !== -1) {
       directories.value.splice(index, 1)
     }
 
-    // 子目录提升一级
     for (const child of directories.value) {
       if (child.parentId === id) {
         child.parentId = parentId
