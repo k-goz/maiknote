@@ -875,6 +875,330 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
+/// Information about a markdown file in the Boss Brain vault
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct VaultFileInfo {
+    pub relative_path: String,
+    pub modified_ms: u64,
+    pub size: u64,
+}
+
+/// Get default Boss Brain Vault path in iCloud
+#[tauri::command]
+async fn get_default_vault_path() -> Result<String, String> {
+    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    let path = format!("{}/Library/Mobile Documents/com~apple~CloudDocs/BossBrain", home);
+    Ok(path)
+}
+
+/// Initialize standard Boss Brain vault folders
+#[tauri::command]
+async fn ensure_vault_structure(vault_path: String) -> Result<(), String> {
+    let root = PathBuf::from(&vault_path);
+    let folders = [
+        "00-Inbox",
+        "01-Projects",
+        "02-Areas",
+        "03-Knowledge",
+        "04-Playbooks",
+        "05-Decisions",
+        "90-Archive",
+        "_assets",
+        "_system",
+        ".bossbrain",
+    ];
+
+    for folder in &folders {
+        let p = root.join(folder);
+        fs::create_dir_all(&p).map_err(|e| format!("Failed to create folder {:?}: {}", p, e))?;
+    }
+
+    Ok(())
+}
+
+fn walk_dir_md(dir: &std::path::Path, root: &std::path::Path, results: &mut Vec<VaultFileInfo>) -> std::io::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        // Strictly skip symlinks to prevent following outside vault or infinite loops
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        let file_name = entry.file_name().to_string_lossy().to_string();
+
+        // Skip hidden/system directories except .bossbrain
+        if file_name.starts_with('.') && file_name != ".bossbrain" {
+            continue;
+        }
+        if file_name == ".git" || file_name == "node_modules" || file_name == "target" || file_name == ".bossbrain" {
+            continue;
+        }
+
+        if path.is_dir() {
+            walk_dir_md(&path, root, results)?;
+        } else if path.is_file() {
+            if path.extension().and_then(|s| s.to_str()) == Some("md") {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    let rel_str = rel.to_string_lossy().to_string();
+                    let metadata = entry.metadata()?;
+                    let modified_ms = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let size = metadata.len();
+
+                    results.push(VaultFileInfo {
+                        relative_path: rel_str,
+                        modified_ms,
+                        size,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Recursively scan vault for .md files
+#[tauri::command]
+async fn scan_vault_files(vault_path: String) -> Result<Vec<VaultFileInfo>, String> {
+    let root = PathBuf::from(&vault_path);
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut results = Vec::new();
+    walk_dir_md(&root, &root, &mut results).map_err(|e| e.to_string())?;
+
+    results.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(results)
+}
+
+/// Validate and resolve a relative path inside vault_root safely.
+/// Rejects absolute paths, parent directory navigation (..), prefix components, and symlink escapes.
+pub fn safe_vault_path(vault_root: &std::path::Path, relative_path: &str) -> Result<PathBuf, String> {
+    let trimmed = relative_path.trim();
+    if trimmed.is_empty() {
+        return Err("Relative path cannot be empty".to_string());
+    }
+    let rel = std::path::Path::new(trimmed);
+    if rel.is_absolute() {
+        return Err(format!("Path must be relative, got absolute: {}", relative_path));
+    }
+    for component in rel.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                return Err(format!("Parent directory traversal (..) is strictly forbidden: {}", relative_path));
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(format!("Root or prefix components are strictly forbidden: {}", relative_path));
+            }
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+        }
+    }
+
+    let canonical_root = if vault_root.exists() {
+        vault_root.canonicalize().map_err(|e| format!("Failed to canonicalize vault root: {}", e))?
+    } else {
+        vault_root.to_path_buf()
+    };
+
+    let target = canonical_root.join(rel);
+
+    // If target exists or symlink exists at target
+    if target.exists() || fs::symlink_metadata(&target).is_ok() {
+        let canonical_target = target.canonicalize().map_err(|e| format!("Failed to canonicalize target path: {}", e))?;
+        if !canonical_target.starts_with(&canonical_root) {
+            return Err(format!("Symlink escape attempt detected: {:?} escapes vault root {:?}", canonical_target, canonical_root));
+        }
+        return Ok(canonical_target);
+    }
+
+    // If target does not exist yet (e.g. write new file):
+    // Check intermediate ancestors between target and canonical_root
+    let mut ancestor = target.parent();
+    while let Some(p) = ancestor {
+        if p == canonical_root || !p.starts_with(&canonical_root) {
+            break;
+        }
+        if p.exists() || fs::symlink_metadata(p).is_ok() {
+            let canonical_ancestor = p.canonicalize().map_err(|e| format!("Failed to canonicalize ancestor path: {}", e))?;
+            if !canonical_ancestor.starts_with(&canonical_root) {
+                return Err(format!("Symlink escape attempt detected in ancestor directory: {:?} escapes vault root {:?}", canonical_ancestor, canonical_root));
+            }
+            break;
+        }
+        ancestor = p.parent();
+    }
+
+    Ok(target)
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct VaultFileWriteResult {
+    pub modified_ms: u64,
+    pub size: u64,
+}
+
+/// Read text file at relative path in vault
+#[tauri::command]
+async fn read_vault_text_file(vault_path: String, relative_path: String) -> Result<String, String> {
+    let root = PathBuf::from(&vault_path);
+    let path = safe_vault_path(&root, &relative_path)?;
+    if !path.exists() {
+        return Err(format!("File does not exist: {}", relative_path));
+    }
+    fs::read_to_string(path).map_err(|e| e.to_string())
+}
+
+/// Write text file at relative path in vault, returning exact disk mtime and size
+#[tauri::command]
+async fn write_vault_text_file(vault_path: String, relative_path: String, content: String) -> Result<VaultFileWriteResult, String> {
+    let root = PathBuf::from(&vault_path);
+    let path = safe_vault_path(&root, &relative_path)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::write(&path, content.as_bytes()).map_err(|e| e.to_string())?;
+
+    if let (Ok(canonical), Ok(canonical_root)) = (path.canonicalize(), root.canonicalize()) {
+        if !canonical.starts_with(&canonical_root) {
+            let _ = fs::remove_file(&canonical);
+            return Err(format!("Symlink escape detected after write: {:?}", canonical));
+        }
+    }
+
+    let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let size = metadata.len();
+
+    Ok(VaultFileWriteResult {
+        modified_ms,
+        size,
+    })
+}
+
+/// Delete file at relative path in vault
+#[tauri::command]
+async fn delete_vault_file(vault_path: String, relative_path: String) -> Result<(), String> {
+    let root = PathBuf::from(&vault_path);
+    let path = safe_vault_path(&root, &relative_path)?;
+    if path.exists() || fs::symlink_metadata(&path).is_ok() {
+        if path.is_dir() {
+            fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
+        } else {
+            fs::remove_file(&path).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Base64 encode helper
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+
+        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+
+        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((n >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(n & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Save binary image asset into vault under _assets/
+#[tauri::command]
+async fn save_vault_asset(vault_path: String, relative_path: String, image_data: String) -> Result<VaultFileWriteResult, String> {
+    let root = PathBuf::from(&vault_path);
+    let path = safe_vault_path(&root, &relative_path)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let data_parts: Vec<&str> = image_data.split(',').collect();
+    let base64_data = if data_parts.len() > 1 {
+        data_parts[1]
+    } else {
+        &image_data
+    };
+    let bytes = base64_decode(base64_data)?;
+    fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+
+    if let (Ok(canonical), Ok(canonical_root)) = (path.canonicalize(), root.canonicalize()) {
+        if !canonical.starts_with(&canonical_root) {
+            let _ = fs::remove_file(&canonical);
+            return Err(format!("Symlink escape detected after asset write: {:?}", canonical));
+        }
+    }
+
+    let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let size = metadata.len();
+
+    Ok(VaultFileWriteResult {
+        modified_ms,
+        size,
+    })
+}
+
+/// Read vault asset safely, returning Data URL with proper MIME type
+#[tauri::command]
+async fn read_vault_asset(vault_path: String, relative_path: String) -> Result<String, String> {
+    let root = PathBuf::from(&vault_path);
+    let path = safe_vault_path(&root, &relative_path)?;
+    if !path.exists() {
+        return Err(format!("Asset does not exist: {}", relative_path));
+    }
+    let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+    let mime = match path.extension().and_then(|s| s.to_str()).unwrap_or("") {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        _ => "application/octet-stream",
+    };
+    let b64 = base64_encode(&bytes);
+    Ok(format!("data:{};base64,{}", mime, b64))
+}
+
+/// Check if a path exists
+#[tauri::command]
+async fn path_exists(path: String) -> Result<bool, String> {
+    Ok(PathBuf::from(path).exists())
+}
+
 /// Set window alpha transparency (0.0 - 1.0)
 #[tauri::command]
 async fn set_window_alpha(
@@ -1459,7 +1783,102 @@ pub fn run() {
             autostart::disable_autostart,
             autostart::is_autostart_enabled,
             get_network_info,
+            get_default_vault_path,
+            ensure_vault_structure,
+            scan_vault_files,
+            read_vault_text_file,
+            write_vault_text_file,
+            delete_vault_file,
+            save_vault_asset,
+            read_vault_asset,
+            path_exists,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_safe_vault_path_valid() {
+        let root = Path::new("/Users/test/BossBrain");
+        let result = safe_vault_path(root, "00-Inbox/note.md").unwrap();
+        assert_eq!(result, PathBuf::from("/Users/test/BossBrain/00-Inbox/note.md"));
+
+        let result2 = safe_vault_path(root, "01-Projects/HealthTwin/README.md").unwrap();
+        assert_eq!(result2, PathBuf::from("/Users/test/BossBrain/01-Projects/HealthTwin/README.md"));
+    }
+
+    #[test]
+    fn test_safe_vault_path_rejects_parent_dir() {
+        let root = Path::new("/Users/test/BossBrain");
+        assert!(safe_vault_path(root, "../escape.md").is_err());
+        assert!(safe_vault_path(root, "../../escape.md").is_err());
+        assert!(safe_vault_path(root, "00-Inbox/../../etc/passwd").is_err());
+        assert!(safe_vault_path(root, "foo/bar/../../../secret").is_err());
+    }
+
+    #[test]
+    fn test_safe_vault_path_rejects_absolute_path() {
+        let root = Path::new("/Users/test/BossBrain");
+        assert!(safe_vault_path(root, "/absolute/path.md").is_err());
+        assert!(safe_vault_path(root, "/Users/test/secret.txt").is_err());
+    }
+
+    #[test]
+    fn test_safe_vault_path_rejects_empty() {
+        let root = Path::new("/Users/test/BossBrain");
+        assert!(safe_vault_path(root, "").is_err());
+        assert!(safe_vault_path(root, "   ").is_err());
+    }
+
+    #[test]
+    fn test_symlink_vault_escape_defense() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "bossbrain_symlink_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let vault = temp_dir.join("vault");
+        let outside = temp_dir.join("outside");
+        fs::create_dir_all(&vault).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        // 外部私密文件
+        let private_file = outside.join("private.md");
+        fs::write(&private_file, "top secret outside vault").unwrap();
+
+        // 攻击向量：在 Vault 内创建指向外部的软链接: vault/escape -> outside
+        let escape_link = vault.join("escape");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &escape_link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&outside, &escape_link).unwrap();
+
+        // 1. read escape/private.md → 必须被拒绝
+        let read_res = safe_vault_path(&vault, "escape/private.md");
+        assert!(read_res.is_err(), "Reading file through symlink pointing outside vault MUST be rejected");
+
+        // 2. write escape/new.md → 必须被拒绝
+        let write_res = safe_vault_path(&vault, "escape/new.md");
+        assert!(write_res.is_err(), "Writing file through symlink pointing outside vault MUST be rejected");
+
+        // 3. delete escape/private.md → 必须被拒绝
+        let delete_res = safe_vault_path(&vault, "escape/private.md");
+        assert!(delete_res.is_err(), "Deleting file through symlink pointing outside vault MUST be rejected");
+
+        // 4. scanner → 不得索引 outside 文件
+        let mut results = Vec::new();
+        walk_dir_md(&vault, &vault, &mut results).unwrap();
+        assert_eq!(results.len(), 0, "Scanner must skip symlinks and never index outside files");
+
+        // 清理临时文件
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+}
+
