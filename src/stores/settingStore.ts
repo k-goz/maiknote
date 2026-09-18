@@ -72,6 +72,9 @@ export interface AppSettings {
   aiPromptPrompt: string
   // 百度搜索设置
   baiduSearchKey: string
+  // Boss Brain 设置
+  vaultPath: string
+  enableBossBrain: boolean
 }
 
 export const useSettingStore = defineStore('setting', () => {
@@ -152,6 +155,8 @@ export const useSettingStore = defineStore('setting', () => {
         '若用户的提示词过于简单，主动补全合理的默认规则\n' +
         '若存在矛盾规则，以最后出现的为准并合并',
     baiduSearchKey: '',
+    vaultPath: '',
+    enableBossBrain: true,
   })
 
   // Actions
@@ -283,6 +288,8 @@ export const useSettingStore = defineStore('setting', () => {
           '若用户的提示词过于简单，主动补全合理的默认规则\n' +
           '若存在矛盾规则，以最后出现的为准并合并',
       baiduSearchKey: '',
+      vaultPath: '',
+      enableBossBrain: true,
     }
     saveSettings()
     // 重置 iCloud 中的 AI 配置和百度搜索密钥
